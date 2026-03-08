@@ -4133,7 +4133,8 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
 
     if (stack_hist.size()) {
         if (mod->verCompare(3, 11) < 0) {
-            fprintf(stderr, "AUDIT_WARN_STACK_HISTORY_NON_EMPTY count=%llu\n", stack_hist.size());
+            fprintf(stderr, "AUDIT_WARN_STACK_HISTORY_NON_EMPTY count=%zu\n",
+                    static_cast<size_t>(stack_hist.size()));
             cleanBuild = false;
         }
 
@@ -4146,7 +4147,8 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
 
     if (blocks.size() > 1) {
         if (mod->verCompare(3, 11) < 0) {
-            fprintf(stderr, "AUDIT_WARN_BLOCK_STACK_NON_EMPTY count=%llu\n", blocks.size() - 1);
+            fprintf(stderr, "AUDIT_WARN_BLOCK_STACK_NON_EMPTY count=%zu\n",
+                    static_cast<size_t>(blocks.size() - 1));
             cleanBuild = false;
         }
 
@@ -5471,32 +5473,6 @@ static void normalize_sequential_try_regions(ASTBlock::list_t& lines)
     }
 }
 
-static void partition_nodes_by_offset_ranges(const ASTBlock::list_t& nodes,
-        int first_end, int second_start,
-        ASTBlock::list_t& first_region, ASTBlock::list_t& gap_region, ASTBlock::list_t& second_region)
-{
-    enum Bucket { FIRST, GAP, SECOND };
-    Bucket bucket = FIRST;
-    for (const auto& node : nodes) {
-        int off = (node != NULL) ? node->offset() : -1;
-        if (off >= 0) {
-            if (off >= second_start)
-                bucket = SECOND;
-            else if (off >= first_end)
-                bucket = GAP;
-            else
-                bucket = FIRST;
-        }
-
-        if (bucket == FIRST)
-            first_region.emplace_back(node);
-        else if (bucket == GAP)
-            gap_region.emplace_back(node);
-        else
-            second_region.emplace_back(node);
-    }
-}
-
 static void partition_nodes_by_exception_regions(const ASTBlock::list_t& nodes,
         int first_start, int first_end, int second_start,
         ASTBlock::list_t& prefix, ASTBlock::list_t& first_region,
@@ -5768,8 +5744,8 @@ static bool is_bare_reraise_node(const PycRef<ASTNode>& node)
     return raise != NULL && raise->params().empty();
 }
 
-static void partition_except_blocks_by_target(ASTBlock::list_t& lines,
-        ASTBlock::list_t::iterator begin, ASTBlock::list_t::iterator end,
+static void partition_except_blocks_by_target(ASTBlock::list_t::iterator begin,
+        ASTBlock::list_t::iterator end,
         int second_target,
         std::vector<ASTBlock::list_t::iterator>& first_handlers,
         std::vector<ASTBlock::list_t::iterator>& second_handlers)
@@ -5892,7 +5868,7 @@ static void normalize_exception_table_partitions(ASTBlock::list_t& lines)
 
                     std::vector<ASTBlock::list_t::iterator> first_handlers;
                     std::vector<ASTBlock::list_t::iterator> second_handlers;
-                    partition_except_blocks_by_target(lines, ex1_it, after_ex_it,
+                    partition_except_blocks_by_target(ex1_it, after_ex_it,
                             second_top.target, first_handlers, second_handlers);
                     if (first_handlers.empty() || second_handlers.empty())
                         continue;
@@ -6359,101 +6335,11 @@ static PycRef<ASTBlock> trailing_block_node(PycRef<ASTNode> node)
     return NULL;
 }
 
-static bool cond_ends_with_name(const PycRef<ASTNode>& cond, const char* name)
-{
-    if (cond == NULL || name == NULL)
-        return false;
-    if (cond.type() == ASTNode::NODE_NAME)
-        return cond.cast<ASTName>()->name()->isEqual(name);
-    if (cond.type() == ASTNode::NODE_BINARY || cond.type() == ASTNode::NODE_COMPARE) {
-        PycRef<ASTBinary> bin = cond.cast<ASTBinary>();
-        if (bin->op() == ASTBinary::BIN_ATTR
-                && bin->right() != NULL
-                && bin->right().type() == ASTNode::NODE_NAME
-                && bin->right().cast<ASTName>()->name()->isEqual(name)) {
-            return true;
-        }
-        return cond_ends_with_name(bin->right(), name);
-    }
-    return false;
-}
-
 static bool block_has_terminal_stmt(const PycRef<ASTBlock>& blk)
 {
     if (blk == NULL || blk->nodes().empty())
         return false;
     return is_terminal_stmt(blk->nodes().back());
-}
-
-static bool line_has_tuple_return_arity(const PycRef<ASTNode>& node, int arity)
-{
-    if (node == NULL)
-        return false;
-    if (node.type() == ASTNode::NODE_RETURN) {
-        PycRef<ASTNode> value = node.cast<ASTReturn>()->value();
-        if (value != NULL && value.type() == ASTNode::NODE_TUPLE
-                && (int)value.cast<ASTTuple>()->values().size() == arity) {
-            return true;
-        }
-        return false;
-    }
-    if (node.type() == ASTNode::NODE_BLOCK) {
-        for (const auto& child : node.cast<ASTBlock>()->nodes()) {
-            if (line_has_tuple_return_arity(child, arity))
-                return true;
-        }
-        return false;
-    }
-    if (node.type() == ASTNode::NODE_NODELIST) {
-        for (const auto& child : node.cast<ASTNodeList>()->nodes()) {
-            if (line_has_tuple_return_arity(child, arity))
-                return true;
-        }
-        return false;
-    }
-    return false;
-}
-
-static bool list_has_tuple_return_arity(const ASTBlock::list_t& lines, int arity)
-{
-    for (const auto& node : lines) {
-        if (line_has_tuple_return_arity(node, arity))
-            return true;
-    }
-    return false;
-}
-
-static bool line_has_bool_tuple_return(const PycRef<ASTNode>& node)
-{
-    if (node == NULL)
-        return false;
-    if (node.type() == ASTNode::NODE_RETURN) {
-        PycRef<ASTNode> value = node.cast<ASTReturn>()->value();
-        if (value == NULL || value.type() != ASTNode::NODE_TUPLE)
-            return false;
-        const ASTTuple::value_t& vals = value.cast<ASTTuple>()->values();
-        if (vals.size() != 2 || vals[0] == NULL || vals[0].type() != ASTNode::NODE_OBJECT)
-            return false;
-        PycRef<PycObject> first = vals[0].cast<ASTObject>()->object();
-        return first == Pyc_True || first == Pyc_False
-                || first->type() == PycObject::TYPE_TRUE
-                || first->type() == PycObject::TYPE_FALSE;
-    }
-    if (node.type() == ASTNode::NODE_BLOCK) {
-        for (const auto& child : node.cast<ASTBlock>()->nodes()) {
-            if (line_has_bool_tuple_return(child))
-                return true;
-        }
-        return false;
-    }
-    if (node.type() == ASTNode::NODE_NODELIST) {
-        for (const auto& child : node.cast<ASTNodeList>()->nodes()) {
-            if (line_has_bool_tuple_return(child))
-                return true;
-        }
-        return false;
-    }
-    return false;
 }
 
 static bool block_returns_none_only(const PycRef<ASTBlock>& blk)
