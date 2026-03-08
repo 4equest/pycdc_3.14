@@ -39,6 +39,7 @@ DECLARE_PYTHON(3, 10)
 DECLARE_PYTHON(3, 11)
 DECLARE_PYTHON(3, 12)
 DECLARE_PYTHON(3, 13)
+DECLARE_PYTHON(3, 14)
 
 const char* Pyc::OpcodeName(int opcode)
 {
@@ -79,6 +80,10 @@ int Pyc::ByteToOpcode(int maj, int min, int opcode)
         case 4: return python_1_4_map(opcode);
         case 5: return python_1_5_map(opcode);
         case 6: return python_1_6_map(opcode);
+        default:
+            // Newer minor than supported: fall back to latest known 1.x map
+            if (min > 6) return python_1_6_map(opcode);
+            break;
         }
         break;
     case 2:
@@ -91,6 +96,9 @@ int Pyc::ByteToOpcode(int maj, int min, int opcode)
         case 5: return python_2_5_map(opcode);
         case 6: return python_2_6_map(opcode);
         case 7: return python_2_7_map(opcode);
+        default:
+            if (min > 7) return python_2_7_map(opcode);
+            break;
         }
         break;
     case 3:
@@ -109,6 +117,49 @@ int Pyc::ByteToOpcode(int maj, int min, int opcode)
         case 11: return python_3_11_map(opcode);
         case 12: return python_3_12_map(opcode);
         case 13: return python_3_13_map(opcode);
+        case 14: {
+            int mapped = python_3_14_map(opcode);
+            if (mapped != PYC_INVALID_OPCODE)
+                return mapped;
+            if (opcode == 0x80)
+                return Pyc::RESUME_A;
+
+            static bool warned_unknown_raw_opcode[256] = { false };
+            if (opcode >= 0 && opcode < 256) {
+                if (!warned_unknown_raw_opcode[opcode]) {
+                    warned_unknown_raw_opcode[opcode] = true;
+                    fprintf(stderr, "Warning: Python %d.%d unknown raw opcode 0x%02X; treating as CACHE\n",
+                            maj, min, opcode);
+                }
+            } else {
+                fprintf(stderr, "Warning: Python %d.%d unknown raw opcode %d; treating as CACHE\n",
+                        maj, min, opcode);
+            }
+            return CACHE;
+        }
+        default:
+            // Newer minor than supported: fall back to latest known 3.x map
+            if (min > 14) {
+                int mapped = python_3_14_map(opcode);
+                if (mapped != PYC_INVALID_OPCODE)
+                    return mapped;
+                if (opcode == 0x80)
+                    return Pyc::RESUME_A;
+
+                static bool warned_unknown_raw_opcode[256] = { false };
+                if (opcode >= 0 && opcode < 256) {
+                    if (!warned_unknown_raw_opcode[opcode]) {
+                        warned_unknown_raw_opcode[opcode] = true;
+                        fprintf(stderr, "Warning: Python %d.%d unknown raw opcode 0x%02X; treating as CACHE\n",
+                                maj, min, opcode);
+                    }
+                } else {
+                    fprintf(stderr, "Warning: Python %d.%d unknown raw opcode %d; treating as CACHE\n",
+                            maj, min, opcode);
+                }
+                return CACHE;
+            }
+            break;
         }
         break;
     }
@@ -266,6 +317,17 @@ void print_const(std::ostream& pyc_output, PycRef<PycObject> obj, PycModule* mod
     case PycObject::TYPE_BINARY_COMPLEX:
         formatted_print(pyc_output, "(%g+%gj)", obj.cast<PycCComplex>()->value(),
                                         obj.cast<PycCComplex>()->imag());
+        break;
+    case PycObject::TYPE_SLICE:
+        {
+            pyc_output << "slice(";
+            print_const(pyc_output, obj.cast<PycSlice>()->start(), mod);
+            pyc_output << ", ";
+            print_const(pyc_output, obj.cast<PycSlice>()->stop(), mod);
+            pyc_output << ", ";
+            print_const(pyc_output, obj.cast<PycSlice>()->step(), mod);
+            pyc_output << ")";
+        }
         break;
     case PycObject::TYPE_CODE:
     case PycObject::TYPE_CODE2:
@@ -590,6 +652,21 @@ void bc_disasm(std::ostream& pyc_output, PycRef<PycCode> code, PycModule* mod,
                 default:
                     formatted_print(pyc_output, "%d (UNKNOWN)", operand);
                     break;
+                }
+                break;
+            case Pyc::LOAD_SMALL_INT_A:
+                formatted_print(pyc_output, "%d", operand);
+                break;
+            case Pyc::LOAD_SPECIAL_A:
+                {
+                    static const char* special_names[] = {
+                        "__enter__", "__exit__", "__aenter__", "__aexit__"
+                    };
+                    if (operand >= 0
+                            && (size_t)operand < sizeof(special_names) / sizeof(special_names[0]))
+                        formatted_print(pyc_output, "%d (%s)", operand, special_names[operand]);
+                    else
+                        formatted_print(pyc_output, "%d", operand);
                 }
                 break;
             default:

@@ -1,192 +1,105 @@
 #include "pyc_module.h"
 #include "data.h"
+#include <limits>
 #include <stdexcept>
+
+namespace {
+struct MagicVersion {
+    unsigned int magic;
+    int major;
+    int minor;
+    bool unicode;
+};
+
+static const MagicVersion kMagicVersions[] = {
+    { MAGIC_1_0, 1, 0, false },
+    { MAGIC_1_1, 1, 1, false },
+    { MAGIC_1_3, 1, 3, false },
+    { MAGIC_1_4, 1, 4, false },
+    { MAGIC_1_5, 1, 5, false },
+    { MAGIC_1_6, 1, 6, false },
+    { MAGIC_1_6+1, 1, 6, true },
+    { MAGIC_2_0, 2, 0, false },
+    { MAGIC_2_0+1, 2, 0, true },
+    { MAGIC_2_1, 2, 1, false },
+    { MAGIC_2_1+1, 2, 1, true },
+    { MAGIC_2_2, 2, 2, false },
+    { MAGIC_2_2+1, 2, 2, true },
+    { MAGIC_2_3, 2, 3, false },
+    { MAGIC_2_3+1, 2, 3, true },
+    { MAGIC_2_4, 2, 4, false },
+    { MAGIC_2_4+1, 2, 4, true },
+    { MAGIC_2_5, 2, 5, false },
+    { MAGIC_2_5+1, 2, 5, true },
+    { MAGIC_2_6, 2, 6, false },
+    { MAGIC_2_6+1, 2, 6, true },
+    { MAGIC_2_7, 2, 7, false },
+    { MAGIC_2_7+1, 2, 7, true },
+    { MAGIC_3_0+1, 3, 0, true },
+    { MAGIC_3_1+1, 3, 1, true },
+    { MAGIC_3_2, 3, 2, true },
+    { MAGIC_3_3, 3, 3, true },
+    { MAGIC_3_4, 3, 4, true },
+    { MAGIC_3_5, 3, 5, true },
+    { MAGIC_3_5_3, 3, 5, true },
+    { MAGIC_3_6, 3, 6, true },
+    { MAGIC_3_7, 3, 7, true },
+    { MAGIC_3_8, 3, 8, true },
+    { MAGIC_3_9, 3, 9, true },
+    { MAGIC_3_10, 3, 10, true },
+    { MAGIC_3_11, 3, 11, true },
+    { MAGIC_3_12, 3, 12, true },
+    { MAGIC_3_13, 3, 13, true },
+    { MAGIC_3_14A1, 3, 14, true },
+    { MAGIC_3_14_B3, 3, 14, true },
+    { MAGIC_3_14, 3, 14, true },
+};
+}
 
 void PycModule::setVersion(unsigned int magic)
 {
-    // Default for versions that don't support unicode selection
+    m_maj = -1;
+    m_min = -1;
     m_unicode = false;
+    m_exactMagic = false;
 
-    switch (magic) {
-    case MAGIC_1_0:
-        m_maj = 1;
-        m_min = 0;
-        break;
-    case MAGIC_1_1:
-        m_maj = 1;
-        m_min = 1;
-        break;
-    case MAGIC_1_3:
-        m_maj = 1;
-        m_min = 3;
-        break;
-    case MAGIC_1_4:
-        m_maj = 1;
-        m_min = 4;
-        break;
-    case MAGIC_1_5:
-        m_maj = 1;
-        m_min = 5;
-        break;
-
-    /* Starting with 1.6, Python adds +1 for unicode mode (-U) */
-    case MAGIC_1_6+1:
-        m_unicode = true;
-        /* Fall through */
-    case MAGIC_1_6:
-        m_maj = 1;
-        m_min = 6;
-        break;
-    case MAGIC_2_0+1:
-        m_unicode = true;
-        /* Fall through */
-    case MAGIC_2_0:
-        m_maj = 2;
-        m_min = 0;
-        break;
-    case MAGIC_2_1+1:
-        m_unicode = true;
-        /* Fall through */
-    case MAGIC_2_1:
-        m_maj = 2;
-        m_min = 1;
-        break;
-    case MAGIC_2_2+1:
-        m_unicode = true;
-        /* Fall through */
-    case MAGIC_2_2:
-        m_maj = 2;
-        m_min = 2;
-        break;
-    case MAGIC_2_3+1:
-        m_unicode = true;
-        /* Fall through */
-    case MAGIC_2_3:
-        m_maj = 2;
-        m_min = 3;
-        break;
-    case MAGIC_2_4+1:
-        m_unicode = true;
-        /* Fall through */
-    case MAGIC_2_4:
-        m_maj = 2;
-        m_min = 4;
-        break;
-    case MAGIC_2_5+1:
-        m_unicode = true;
-        /* Fall through */
-    case MAGIC_2_5:
-        m_maj = 2;
-        m_min = 5;
-        break;
-    case MAGIC_2_6+1:
-        m_unicode = true;
-        /* Fall through */
-    case MAGIC_2_6:
-        m_maj = 2;
-        m_min = 6;
-        break;
-    case MAGIC_2_7+1:
-        m_unicode = true;
-        /* Fall through */
-    case MAGIC_2_7:
-        m_maj = 2;
-        m_min = 7;
-        break;
-
-    /* 3.0 and above are always unicode */
-    case MAGIC_3_0+1:
-        m_maj = 3;
-        m_min = 0;
-        m_unicode = true;
-        break;
-    case MAGIC_3_1+1:
-        m_maj = 3;
-        m_min = 1;
-        m_unicode = true;
-        break;
-
-    /* 3.2 stops using the unicode increment */
-    case MAGIC_3_2:
-        m_maj = 3;
-        m_min = 2;
-        m_unicode = true;
-        break;
-
-    case MAGIC_3_3:
-        m_maj = 3;
-        m_min = 3;
-        m_unicode = true;
-        break;
-
-    case MAGIC_3_4:
-        m_maj = 3;
-        m_min = 4;
-        m_unicode = true;
-        break;
-
-    case MAGIC_3_5:
-        /* fall through */
-
-    case MAGIC_3_5_3:
-        m_maj = 3;
-        m_min = 5;
-        m_unicode = true;
-        break;
-
-    case MAGIC_3_6:
-        m_maj = 3;
-        m_min = 6;
-        m_unicode = true;
-        break;
-
-    case MAGIC_3_7:
-        m_maj = 3;
-        m_min = 7;
-        m_unicode = true;
-        break;
-
-    case MAGIC_3_8:
-        m_maj = 3;
-        m_min = 8;
-        m_unicode = true;
-        break;
-
-    case MAGIC_3_9:
-        m_maj = 3;
-        m_min = 9;
-        m_unicode = true;
-        break;
-
-    case MAGIC_3_10:
-        m_maj = 3;
-        m_min = 10;
-        m_unicode = true;
-        break;
-
-    case MAGIC_3_11:
-        m_maj = 3;
-        m_min = 11;
-        m_unicode = true;
-        break;
-
-    case MAGIC_3_12:
-        m_maj = 3;
-        m_min = 12;
-        m_unicode = true;
-        break;
-
-    case MAGIC_3_13:
-        m_maj = 3;
-        m_min = 13;
-        m_unicode = true;
-        break;
-
-    /* Bad Magic detected */
-    default:
-        m_maj = -1;
-        m_min = -1;
+    for (size_t i = 0; i < sizeof(kMagicVersions) / sizeof(kMagicVersions[0]); ++i) {
+        if (kMagicVersions[i].magic == magic) {
+            m_maj = kMagicVersions[i].major;
+            m_min = kMagicVersions[i].minor;
+            m_unicode = kMagicVersions[i].unicode;
+            m_exactMagic = true;
+            return;
+        }
     }
+
+    if ((magic & 0xFFFF0000U) != 0x0A0D0000U)
+        return;
+
+    const MagicVersion* best = NULL;
+    unsigned int bestDelta = std::numeric_limits<unsigned int>::max();
+    for (size_t i = 0; i < sizeof(kMagicVersions) / sizeof(kMagicVersions[0]); ++i) {
+        if (kMagicVersions[i].major < 3)
+            continue;
+
+        unsigned int delta = (magic > kMagicVersions[i].magic)
+            ? magic - kMagicVersions[i].magic
+            : kMagicVersions[i].magic - magic;
+        if ((best == NULL) || (delta < bestDelta)
+                || ((delta == bestDelta) && (kMagicVersions[i].minor > best->minor))) {
+            best = &kMagicVersions[i];
+            bestDelta = delta;
+        }
+    }
+    if (best == NULL)
+        return;
+    // Guard against obviously corrupted headers that only match by nearest distance.
+    if (bestDelta > 0x80U)
+        return;
+
+    m_maj = best->major;
+    m_min = best->minor;
+    m_unicode = best->unicode;
 }
 
 bool PycModule::isSupportedVersion(int major, int minor)
@@ -197,7 +110,7 @@ bool PycModule::isSupportedVersion(int major, int minor)
     case 2:
         return (minor >= 0 && minor <= 7);
     case 3:
-        return (minor >= 0 && minor <= 12);
+        return (minor >= 0 && minor <= 14);
     default:
         return false;
     }
@@ -210,10 +123,15 @@ void PycModule::loadFromFile(const char* filename)
         fprintf(stderr, "Error opening file %s\n", filename);
         return;
     }
-    setVersion(in.get32());
+    unsigned int magic = in.get32();
+    setVersion(magic);
     if (!isValid()) {
         fputs("Bad MAGIC!\n", stderr);
         return;
+    }
+    if (!hasExactMagicMatch()) {
+        fprintf(stderr, "Warning: unknown CPython magic 0x%08X, falling back to Python %d.%d\n",
+            magic, m_maj, m_min);
     }
 
     int flags = 0;

@@ -36,13 +36,16 @@ enum PycMagic {
     MAGIC_3_11 = 0x0A0D0DA7,
     MAGIC_3_12 = 0x0A0D0DCB,
     MAGIC_3_13 = 0x0A0D0DF3,
+    MAGIC_3_14A1 = 0x0A0D0E10,
+    MAGIC_3_14_B3 = 0x0A0D0E29,
+    MAGIC_3_14 = 0x0A0D0E2B,
 
     INVALID = 0,
 };
 
 class PycModule {
 public:
-    PycModule() : m_maj(-1), m_min(-1), m_unicode(false) { }
+    PycModule() : m_maj(-1), m_min(-1), m_unicode(false), m_exactMagic(false) { }
 
     void loadFromFile(const char* filename);
     void loadFromMarshalledFile(const char *filename, int major, int minor);
@@ -50,6 +53,7 @@ public:
 
     int majorVer() const { return m_maj; }
     int minorVer() const { return m_min; }
+    bool hasExactMagicMatch() const { return m_exactMagic; }
 
     int verCompare(int maj, int min) const
     {
@@ -86,6 +90,7 @@ private:
 private:
     int m_maj, m_min;
     bool m_unicode;
+    bool m_exactMagic;
 
     PycRef<PycCode> m_code;
     std::vector<PycRef<PycString>> m_interns;

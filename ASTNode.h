@@ -5,6 +5,8 @@
 #include <list>
 #include <deque>
 
+extern int g_ast_append_offset_hint;
+
 /* Similar interface to PycObject, so PycRef can work on it... *
  * However, this does *NOT* mean the two are interchangeable!  */
 class ASTNode {
@@ -24,18 +26,21 @@ public:
         NODE_LOCALS,
     };
 
-    ASTNode(int type = NODE_INVALID) : m_refs(), m_type(type), m_processed() { }
+    ASTNode(int type = NODE_INVALID) : m_refs(), m_type(type), m_processed(), m_offset(-1) { }
     virtual ~ASTNode() { }
 
     int type() const { return internalGetType(this); }
 
     bool processed() const { return m_processed; }
     void setProcessed() { m_processed = true; }
+    int offset() const { return m_offset; }
+    void setOffset(int offset) { m_offset = offset; }
 
 private:
     int m_refs;
     int m_type;
     bool m_processed;
+    int m_offset;
 
     // Hack to make clang happy :(
     static int internalGetType(const ASTNode *node)
@@ -71,7 +76,12 @@ public:
     const list_t& nodes() const { return m_nodes; }
     void removeFirst();
     void removeLast();
-    void append(PycRef<ASTNode> node) { m_nodes.emplace_back(std::move(node)); }
+    void append(PycRef<ASTNode> node)
+    {
+        if (node != NULL && node->offset() < 0 && g_ast_append_offset_hint >= 0)
+            node->setOffset(g_ast_append_offset_hint);
+        m_nodes.emplace_back(std::move(node));
+    }
 
 protected:
     ASTNodeList(list_t nodes, ASTNode::Type type)
@@ -546,7 +556,12 @@ public:
     list_t::size_type size() const { return m_nodes.size(); }
     void removeFirst();
     void removeLast();
-    void append(PycRef<ASTNode> node) { m_nodes.emplace_back(std::move(node)); }
+    void append(PycRef<ASTNode> node)
+    {
+        if (node != NULL && node->offset() < 0 && g_ast_append_offset_hint >= 0)
+            node->setOffset(g_ast_append_offset_hint);
+        m_nodes.emplace_back(std::move(node));
+    }
     const char* type_str() const;
 
     virtual int inited() const { return m_inited; }
@@ -572,15 +587,19 @@ public:
     };
 
     ASTCondBlock(ASTBlock::BlkType blktype, int end, PycRef<ASTNode> cond,
-                 bool negative = false)
-        : ASTBlock(blktype, end), m_cond(std::move(cond)), m_negative(negative) { }
+                 bool negative = false, int handler_depth = -1)
+        : ASTBlock(blktype, end), m_cond(std::move(cond)), m_negative(negative),
+          m_handler_depth(handler_depth) { }
 
     PycRef<ASTNode> cond() const { return m_cond; }
     bool negative() const { return m_negative; }
+    int handlerDepth() const { return m_handler_depth; }
+    void setHandlerDepth(int handler_depth) { m_handler_depth = handler_depth; }
 
 private:
     PycRef<ASTNode> m_cond;
     bool m_negative;
+    int m_handler_depth;
 };
 
 
@@ -596,6 +615,7 @@ public:
     int start() const { return m_start; }
 
     void setIndex(PycRef<ASTNode> idx) { m_idx = std::move(idx); init(); }
+    void setIter(PycRef<ASTNode> iter) { m_iter = std::move(iter); }
     void setCondition(PycRef<ASTNode> cond) { m_cond = std::move(cond); }
     void setComprehension(bool comp) { m_comp = comp; }
 
@@ -643,12 +663,18 @@ private:
 class ASTComprehension : public ASTNode {
 public:
     typedef std::list<PycRef<ASTIterBlock>> generator_t;
+    enum Kind {
+        LIST,
+        GENERATOR
+    };
 
-    ASTComprehension(PycRef<ASTNode> result)
-        : ASTNode(NODE_COMPREHENSION), m_result(std::move(result)) { }
+    ASTComprehension(PycRef<ASTNode> result, Kind kind = LIST)
+        : ASTNode(NODE_COMPREHENSION), m_result(std::move(result)), m_kind(kind) { }
 
     PycRef<ASTNode> result() const { return m_result; }
     generator_t generators() const { return m_generators; }
+    Kind kind() const { return m_kind; }
+    bool isGenerator() const { return m_kind == GENERATOR; }
 
     void addGenerator(PycRef<ASTIterBlock> gen) {
         m_generators.emplace_front(std::move(gen));
@@ -657,7 +683,7 @@ public:
 private:
     PycRef<ASTNode> m_result;
     generator_t m_generators;
-
+    Kind m_kind;
 };
 
 class ASTLoadBuildClass : public ASTNode {
