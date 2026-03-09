@@ -30,9 +30,15 @@ static bool is_none_exit_call_any_receiver(const PycRef<ASTNode>& node);
 static bool node_uses_name(const PycRef<ASTNode>& node, const char* name);
 static bool is_pass_only_node(const PycRef<ASTNode>& node);
 static bool is_jump_opcode(int opcode);
+static bool is_control_flow_terminal_stmt(const PycRef<ASTNode>& node);
+static bool is_exception_alias_store_opcode(int opcode);
+static bool is_exception_alias_delete_opcode(int opcode);
+static bool is_none_load_const(const PycRef<PycCode>& code, int opcode, int operand);
+static int jump_backward_target(PycBuffer source, PycModule* mod, int pos, int operand);
 static bool is_pass_handler_at_target(const PycRef<PycCode>& code, int target,
         int continuation, int max_stack_depth = 1);
 static bool list_contains_offset_in_range(const ASTBlock::list_t& nodes, int start, int end);
+static bool is_bare_reraise_node(const PycRef<ASTNode>& node);
 static bool is_bare_reraise_except_block(const PycRef<ASTBlock>& blk);
 static void normalize_nested_with_except(ASTBlock::list_t& lines);
 static void normalize_elif_chains(ASTBlock::list_t& lines);
@@ -97,6 +103,7 @@ static PycRef<ASTNode> normalize_slice_bound(PycRef<ASTNode> node)
 static PycRef<ASTNode> build_slice_node(PycRef<ASTNode> start,
         PycRef<ASTNode> stop, PycRef<ASTNode> step = {})
 {
+    const bool has_explicit_step = step != NULL;
     start = normalize_slice_bound(std::move(start));
     stop = normalize_slice_bound(std::move(stop));
     step = normalize_slice_bound(std::move(step));
@@ -112,7 +119,7 @@ static PycRef<ASTNode> build_slice_node(PycRef<ASTNode> start,
         base = new ASTSlice(ASTSlice::SLICE3, start, stop);
     }
 
-    if (step == NULL)
+    if (!has_explicit_step)
         return base;
 
     return new ASTSlice(ASTSlice::SLICE3, base, step);
@@ -136,7 +143,7 @@ static PycRef<ASTNode> rebuild_constant_slice(const PycRef<ASTNode>& node)
         stop = new ASTObject(slice->stop());
 
     PycRef<ASTNode> step;
-    if (slice->step() != NULL)
+    if (slice->step() != NULL && slice->step()->type() != PycObject::TYPE_NONE)
         step = new ASTObject(slice->step());
 
     return build_slice_node(start, stop, step);
@@ -307,6 +314,83 @@ static int next_meaningful_opcode_pos(const PycRef<PycCode>& code, PycModule* mo
             return start;
     }
     return pos;
+}
+
+static int previous_meaningful_opcode_pos(const PycRef<PycCode>& code, PycModule* mod, int pos,
+        int* out_opcode = NULL, int* out_operand = NULL)
+{
+    if (out_opcode != NULL)
+        *out_opcode = -1;
+    if (out_operand != NULL)
+        *out_operand = 0;
+    if (code == NULL || code->code() == NULL || pos <= 0 || pos > code->code()->length())
+        return -1;
+
+    const unsigned char* base = (const unsigned char*)code->code()->value();
+    PycBuffer source(base, code->code()->length());
+    int cursor = 0;
+    int last_pos = -1;
+    int last_opcode = -1;
+    int last_operand = 0;
+    while (!source.atEof() && cursor < pos) {
+        int look_opcode, look_operand;
+        int start = cursor;
+        bc_next(source, mod, look_opcode, look_operand, cursor);
+        if (start >= pos)
+            break;
+        if (look_opcode == Pyc::CACHE || look_opcode == Pyc::NOP)
+            continue;
+        last_pos = start;
+        last_opcode = look_opcode;
+        last_operand = look_operand;
+    }
+    if (out_opcode != NULL)
+        *out_opcode = last_opcode;
+    if (out_operand != NULL)
+        *out_operand = last_operand;
+    return last_pos;
+}
+
+static bool is_cleanup_reraise_after_backjump(const PycRef<PycCode>& code, PycModule* mod, int pos)
+{
+    int prev_opcode = -1;
+    int prev_operand = 0;
+    int prev_pos = previous_meaningful_opcode_pos(code, mod, pos, &prev_opcode, &prev_operand);
+    if (prev_pos < 0 || code == NULL || code->code() == NULL)
+        return false;
+
+    const unsigned char* base = (const unsigned char*)code->code()->value();
+    auto is_backward_cleanup_jump = [&](int jump_pos, int jump_operand) {
+        PycBuffer source(base + jump_pos, code->code()->length() - jump_pos);
+        return jump_backward_target(source, mod, jump_pos, jump_operand) < jump_pos;
+    };
+
+    if (prev_opcode == Pyc::JUMP_BACKWARD_A || prev_opcode == Pyc::JUMP_BACKWARD_NO_INTERRUPT_A)
+        return is_backward_cleanup_jump(prev_pos, prev_operand);
+
+    if (!is_exception_alias_delete_opcode(prev_opcode))
+        return false;
+    const int alias_operand = prev_operand;
+
+    int store_opcode = -1;
+    int store_operand = 0;
+    int store_pos = previous_meaningful_opcode_pos(code, mod, prev_pos, &store_opcode, &store_operand);
+    if (store_pos < 0 || !is_exception_alias_store_opcode(store_opcode) || store_operand != alias_operand)
+        return false;
+
+    int none_opcode = -1;
+    int none_operand = 0;
+    int none_pos = previous_meaningful_opcode_pos(code, mod, store_pos, &none_opcode, &none_operand);
+    if (none_pos < 0 || !is_none_load_const(code, none_opcode, none_operand))
+        return false;
+
+    int jump_opcode = -1;
+    int jump_operand = 0;
+    int jump_pos = previous_meaningful_opcode_pos(code, mod, none_pos, &jump_opcode, &jump_operand);
+    if (jump_pos < 0
+            || (jump_opcode != Pyc::JUMP_BACKWARD_A && jump_opcode != Pyc::JUMP_BACKWARD_NO_INTERRUPT_A))
+        return false;
+    return is_backward_cleanup_jump(jump_pos, jump_operand);
 }
 
 static bool is_handler_scan_noop(int opcode)
@@ -1111,6 +1195,8 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
                     TOS = stack.top();
                     TOS_type = TOS.type();
                 }
+                if (!(mod->majorVer() == 3 && mod->minorVer() == 4))
+                    std::reverse(bases.begin(), bases.end());
                 // qualified name is PycString at TOS
                 PycRef<ASTNode> name = stack.top();
                 stack.pop();
@@ -2041,8 +2127,12 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
                     if (curblock->blktype() == ASTBlock::BLK_FOR) {
                         bool is_jump_to_start = offs == curblock.cast<ASTIterBlock>()->start();
                         bool should_pop_for_block = curblock.cast<ASTIterBlock>()->isComprehension();
-                        // in v3.8, SETUP_LOOP is deprecated and for blocks aren't terminated by POP_BLOCK, so we add them here
-                        bool should_add_for_block = mod->majorVer() == 3 && mod->minorVer() >= 8 && is_jump_to_start && !curblock.cast<ASTIterBlock>()->isComprehension();
+                        // Python 3.8-3.11 no longer use POP_BLOCK to close for-loops.
+                        // Python 3.12+ emits END_FOR, so closing here would double-pop nested loops.
+                        bool should_add_for_block = mod->verCompare(3, 8) >= 0
+                            && mod->verCompare(3, 12) < 0
+                            && is_jump_to_start
+                            && !curblock.cast<ASTIterBlock>()->isComprehension();
 
                         if (should_pop_for_block || should_add_for_block) {
                             PycRef<ASTNode> top = stack.top();
@@ -3049,8 +3139,8 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
                    in Python 3.11+.  These are exception-table re-raises, not user code. */
                 if (mod->verCompare(3, 11) >= 0
                         && curblock->blktype() == ASTBlock::BLK_EXCEPT
-                        && curblock->end() != 0
-                        && curblock->end() <= curpos)
+                        && ((curblock->end() != 0 && curblock->end() <= curpos)
+                            || is_cleanup_reraise_after_backjump(code, mod, curpos)))
                     break;
 
                 curblock->append(new ASTRaise(ASTRaise::param_t()));
@@ -4652,17 +4742,28 @@ static ASTBlock::list_t normalize_except_sequences(ASTBlock::list_t lines, PycMo
 
 static bool is_terminal_stmt(const PycRef<ASTNode>& node)
 {
+    // Keep linear dead-code pruning narrow. Raise/break/continue can still
+    // participate in later block reshaping and must not be dropped here.
     if (node == NULL)
         return false;
     if (node.type() == ASTNode::NODE_RETURN) {
         PycRef<ASTReturn> ret = node.cast<ASTReturn>();
         return ret->rettype() == ASTReturn::RETURN;
     }
+    return false;
+}
+
+static bool is_control_flow_terminal_stmt(const PycRef<ASTNode>& node)
+{
+    if (is_terminal_stmt(node))
+        return true;
+    if (node == NULL)
+        return false;
     if (node.type() == ASTNode::NODE_RAISE)
         return true;
     if (node.type() == ASTNode::NODE_KEYWORD) {
-        ASTKeyword::Word kw = node.cast<ASTKeyword>()->key();
-        return kw == ASTKeyword::KW_BREAK || kw == ASTKeyword::KW_CONTINUE;
+        PycRef<ASTKeyword> kw = node.cast<ASTKeyword>();
+        return kw->key() == ASTKeyword::KW_BREAK || kw->key() == ASTKeyword::KW_CONTINUE;
     }
     return false;
 }
@@ -4736,6 +4837,116 @@ static bool is_delete_of_name(const PycRef<ASTNode>& node, const PycRef<PycStrin
     return del->value() != NULL
             && del->value().type() == ASTNode::NODE_NAME
             && del->value().cast<ASTName>()->name()->isEqual(name->value());
+}
+
+static bool is_store_to_named_dest(const PycRef<ASTNode>& node, const char* name)
+{
+    if (node == NULL || name == NULL || node.type() != ASTNode::NODE_STORE)
+        return false;
+    PycRef<ASTStore> st = node.cast<ASTStore>();
+    return st->dest() != NULL
+            && st->dest().type() == ASTNode::NODE_NAME
+            && st->dest().cast<ASTName>()->name()->isEqual(name);
+}
+
+static bool is_named_call(const PycRef<ASTNode>& node, const char* name)
+{
+    if (node == NULL || name == NULL || node.type() != ASTNode::NODE_CALL)
+        return false;
+    PycRef<ASTCall> call = node.cast<ASTCall>();
+    return call->func() != NULL
+            && call->func().type() == ASTNode::NODE_NAME
+            && call->func().cast<ASTName>()->name()->isEqual(name)
+            && call->pparams().empty()
+            && call->kwparams().empty()
+            && !call->hasVar()
+            && !call->hasKW();
+}
+
+static bool is_auto_class_firstlineno_front(const PycRef<ASTNode>& node)
+{
+    return is_store_to_named_dest(node, "__firstlineno__");
+}
+
+static bool is_auto_classdict_front(const PycRef<ASTNode>& node)
+{
+    if (!is_store_to_named_dest(node, "__classdict__"))
+        return false;
+    PycRef<ASTStore> st = node.cast<ASTStore>();
+    return is_named_call(st->src(), "locals")
+            || (st->src() != NULL && st->src().type() == ASTNode::NODE_LOCALS);
+}
+
+static bool is_auto_static_attributes_tail(const PycRef<ASTNode>& node)
+{
+    return is_store_to_named_dest(node, "__static_attributes__");
+}
+
+static bool is_auto_classdictcell_tail(const PycRef<ASTNode>& node)
+{
+    if (!is_store_to_named_dest(node, "__classdictcell__"))
+        return false;
+    PycRef<ASTStore> st = node.cast<ASTStore>();
+    return st->src() != NULL
+            && st->src().type() == ASTNode::NODE_NAME
+            && st->src().cast<ASTName>()->name()->isEqual("__classdict__");
+}
+
+static void strip_auto_class_metadata(const PycRef<ASTNodeList>& clean)
+{
+    if (clean == NULL)
+        return;
+
+    while (!clean->nodes().empty() && clean->nodes().back().type() == ASTNode::NODE_RETURN) {
+        PycRef<ASTReturn> ret = clean->nodes().back().cast<ASTReturn>();
+        if (ret->rettype() != ASTReturn::RETURN)
+            break;
+        if (ret->value() == NULL || ret->value().type() == ASTNode::NODE_LOCALS
+                || is_none_like_node(ret->value())) {
+            clean->removeLast();
+            continue;
+        }
+        break;
+    }
+
+    if (clean->nodes().empty())
+        return;
+
+    if (!is_auto_classdictcell_tail(clean->nodes().back()))
+        return;
+
+    ASTNodeList::list_t::const_iterator it = clean->nodes().begin();
+    if (it != clean->nodes().end() && is_auto_class_firstlineno_front(*it))
+        ++it;
+    if (it == clean->nodes().end() || !is_auto_classdict_front(*it))
+        return;
+
+    clean->removeLast();
+    if (!clean->nodes().empty() && is_auto_static_attributes_tail(clean->nodes().back()))
+        clean->removeLast();
+    if (!clean->nodes().empty() && is_auto_class_firstlineno_front(clean->nodes().front()))
+        clean->removeFirst();
+    if (!clean->nodes().empty() && is_auto_classdict_front(clean->nodes().front()))
+        clean->removeFirst();
+}
+
+static void strip_trailing_implicit_returns(const PycRef<ASTNodeList>& clean)
+{
+    if (clean == NULL)
+        return;
+
+    while (!clean->nodes().empty() && clean->nodes().back().type() == ASTNode::NODE_RETURN) {
+        PycRef<ASTReturn> ret = clean->nodes().back().cast<ASTReturn>();
+        if (ret->rettype() != ASTReturn::RETURN)
+            break;
+
+        if (ret->value() == NULL || ret->value().type() == ASTNode::NODE_LOCALS ||
+                is_none_like_node(ret->value())) {
+            clean->removeLast();
+        } else {
+            break;
+        }
+    }
 }
 
 static void strip_trailing_none_cleanup(ASTBlock::list_t& lines)
@@ -5049,7 +5260,7 @@ static bool block_has_terminal_stmt_before_synthetic_except_tail(const PycRef<AS
             continue;
         if (is_pass_only_node(*it) || is_synthetic_loop_keyword_node(*it))
             continue;
-        return is_terminal_stmt(*it);
+        return is_control_flow_terminal_stmt(*it);
     }
     return false;
 }
@@ -5385,7 +5596,7 @@ static size_t matching_suffix_before_terminal_len(const ASTBlock::list_t& lhs,
         return 0;
 
     ASTBlock::list_t::const_iterator lhs_end = lhs.end();
-    if (is_terminal_stmt(lhs.back())) {
+    if (is_control_flow_terminal_stmt(lhs.back())) {
         --lhs_end;
         if (lhs.begin() == lhs_end)
             return 0;
@@ -5414,7 +5625,7 @@ static void strip_block_suffix_before_terminal(const PycRef<ASTBlock>& blk, size
 {
     if (blk == NULL || count == 0 || blk->size() == 0)
         return;
-    if (!is_terminal_stmt(blk->nodes().back())) {
+    if (!is_control_flow_terminal_stmt(blk->nodes().back())) {
         strip_block_suffix(blk, count);
         return;
     }
@@ -6267,12 +6478,12 @@ static void normalize_trailing_reraise_finally(ASTBlock::list_t& lines)
                 for (const auto& ex : second_excepts)
                     finally_body.emplace_back(ex);
                 for (; it1 != first_try->nodes().end(); ++it1) {
-                    if (!is_terminal_stmt(*it1))
+                    if (!is_control_flow_terminal_stmt(*it1))
                         finally_body.emplace_back(*it1);
                 }
             } else {
                 // Fallback: use first try stripped of terminal + its excepts
-                while (first_try->size() > 0 && is_terminal_stmt(first_try->nodes().back()))
+                while (first_try->size() > 0 && is_control_flow_terminal_stmt(first_try->nodes().back()))
                     first_try->removeLast();
                 finally_body.emplace_back(first_try.cast<ASTNode>());
                 for (const auto& ex : first_excepts)
@@ -6280,7 +6491,7 @@ static void normalize_trailing_reraise_finally(ASTBlock::list_t& lines)
             }
         } else if (first_try != NULL) {
             // Single try copy. Strip terminal and use it.
-            while (first_try->size() > 0 && is_terminal_stmt(first_try->nodes().back()))
+            while (first_try->size() > 0 && is_control_flow_terminal_stmt(first_try->nodes().back()))
                 first_try->removeLast();
             finally_body.emplace_back(first_try.cast<ASTNode>());
             for (const auto& ex : first_excepts)
@@ -6438,7 +6649,7 @@ static bool block_has_terminal_stmt(const PycRef<ASTBlock>& blk)
 {
     if (blk == NULL || blk->nodes().empty())
         return false;
-    return is_terminal_stmt(blk->nodes().back());
+    return is_control_flow_terminal_stmt(blk->nodes().back());
 }
 
 static bool block_returns_none_only(const PycRef<ASTBlock>& blk)
@@ -7903,29 +8114,9 @@ static bool code_has_leading_docstring(PycRef<PycCode> code, PycModule* mod)
         return false;
     if (code->getConst(0).try_cast<PycString>() == NULL)
         return false;
-
-    PycBuffer source(code->code()->value(), code->code()->length());
-    int pos = 0;
-    int opcode = Pyc::PYC_INVALID_OPCODE;
-    int operand = 0;
-    do {
-        if (source.atEof())
-            return false;
-        bc_next(source, mod, opcode, operand, pos);
-    } while (opcode == Pyc::CACHE);
-
-    if (opcode != Pyc::LOAD_CONST_A || operand != 0)
-        return false;
-
-    int opcode2 = Pyc::PYC_INVALID_OPCODE;
-    int operand2 = 0;
-    do {
-        if (source.atEof())
-            return false;
-        bc_next(source, mod, opcode2, operand2, pos);
-    } while (opcode2 == Pyc::CACHE);
-
-    return opcode2 == Pyc::POP_TOP;
+    if (mod != NULL && mod->verCompare(3, 14) >= 0)
+        return (code->flags() & PycCode::CO_HAS_DOCSTRING) != 0;
+    return true;
 }
 
 static std::unordered_set<PycCode *> code_seen;
@@ -7943,6 +8134,7 @@ void decompyle(PycRef<PycCode> code, PycModule* mod, std::ostream& pyc_output)
     PycRef<ASTNode> source = BuildFromCode(code, mod);
 
     PycRef<ASTNodeList> clean = source.cast<ASTNodeList>();
+    const bool stripClassMetadata = printClassDocstring && !code->name()->isEqual("<module>");
     if (cleanBuild) {
         // The Python compiler adds some stuff that we don't really care
         // about, and would add extra code for re-compilation anyway.
@@ -7977,8 +8169,11 @@ void decompyle(PycRef<PycCode> code, PycModule* mod, std::ostream& pyc_output)
             }
         }
 
+        if (stripClassMetadata)
+            strip_auto_class_metadata(clean);
+
         // Class and module docstrings may only appear at the beginning of their source
-        if (printClassDocstring && clean->nodes().front().type() == ASTNode::NODE_STORE) {
+        if (printClassDocstring && !clean->nodes().empty() && clean->nodes().front().type() == ASTNode::NODE_STORE) {
             PycRef<ASTStore> store = clean->nodes().front().cast<ASTStore>();
             if (store->dest().type() == ASTNode::NODE_NAME &&
                     store->dest().cast<ASTName>()->name()->isEqual("__doc__") &&
@@ -7990,18 +8185,7 @@ void decompyle(PycRef<PycCode> code, PycModule* mod, std::ostream& pyc_output)
         }
     }
     // Always strip extraneous trailing return (the compiler always adds one)
-    while (clean->nodes().size() > 0 && clean->nodes().back().type() == ASTNode::NODE_RETURN) {
-        PycRef<ASTReturn> ret = clean->nodes().back().cast<ASTReturn>();
-        if (ret->rettype() != ASTReturn::RETURN)
-            break;
-
-        if (ret->value() == NULL || ret->value().type() == ASTNode::NODE_LOCALS ||
-                is_none_like_node(ret->value())) {
-            clean->removeLast();  // Always an extraneous return statement
-        } else {
-            break;
-        }
-    }
+    strip_trailing_implicit_returns(clean);
     if (printClassDocstring)
         printClassDocstring = false;
     // This is outside the clean check so a source block will always
