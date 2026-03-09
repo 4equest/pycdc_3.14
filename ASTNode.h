@@ -568,6 +568,7 @@ public:
     virtual void init() { m_inited = 1; }
     virtual void init(int init) { m_inited = init; }
 
+    void setBlkType(BlkType type) { m_blktype = type; }
     void setEnd(int end) { m_end = end; }
 
 private:

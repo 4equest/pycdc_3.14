@@ -35,6 +35,7 @@ static bool is_pass_handler_at_target(const PycRef<PycCode>& code, int target,
 static bool list_contains_offset_in_range(const ASTBlock::list_t& nodes, int start, int end);
 static bool is_bare_reraise_except_block(const PycRef<ASTBlock>& blk);
 static void normalize_nested_with_except(ASTBlock::list_t& lines);
+static void normalize_elif_chains(ASTBlock::list_t& lines);
 static void normalize_sequential_try_regions(ASTBlock::list_t& lines);
 static void normalize_exception_table_partitions(ASTBlock::list_t& lines);
 static void normalize_nested_except_handler_partitions(ASTBlock::list_t& lines);
@@ -174,19 +175,33 @@ static int first_depth_zero_protected_start(const PycRef<PycCode>& code)
     return start == std::numeric_limits<int>::max() ? -1 : start;
 }
 
-static bool is_python_keyword(const std::string& name)
+static bool is_python_keyword(const std::string& name, int maj, int min)
 {
-    static const std::unordered_set<std::string> keywords = {
-        "False", "None", "True", "and", "as", "assert", "async", "await",
-        "break", "class", "continue", "def", "del", "elif", "else", "except",
-        "finally", "for", "from", "global", "if", "import", "in", "is",
-        "lambda", "nonlocal", "not", "or", "pass", "raise", "return", "try",
-        "while", "with", "yield"
+    static const std::unordered_set<std::string> always_keywords = {
+        "and", "assert", "break", "class", "continue", "def", "del",
+        "elif", "else", "except", "finally", "for", "from", "global",
+        "if", "import", "in", "is", "lambda", "not", "or", "pass",
+        "raise", "return", "try", "while", "yield"
     };
-    return keywords.find(name) != keywords.end();
+    if (always_keywords.find(name) != always_keywords.end())
+        return true;
+
+    if (maj < 3 && (name == "exec" || name == "print"))
+        return true;
+
+    if (((maj == 2 && min >= 6) || maj >= 3) && (name == "as" || name == "with"))
+        return true;
+
+    if (maj >= 3 && (name == "None" || name == "True" || name == "False" || name == "nonlocal"))
+        return true;
+
+    if ((maj > 3 || (maj == 3 && min >= 7)) && (name == "async" || name == "await"))
+        return true;
+
+    return false;
 }
 
-static std::string sanitize_identifier(const std::string& raw)
+static std::string sanitize_identifier(const std::string& raw, int maj, int min)
 {
     if (raw.empty())
         return "_";
@@ -214,7 +229,7 @@ static std::string sanitize_identifier(const std::string& raw)
         }
     }
 
-    if (valid && !is_python_keyword(raw))
+    if (valid && !is_python_keyword(raw, maj, min))
         return raw;
 
     std::string out;
@@ -232,7 +247,7 @@ static std::string sanitize_identifier(const std::string& raw)
 
     if (out.empty())
         out = "_";
-    if (is_python_keyword(out))
+    if (is_python_keyword(out, maj, min))
         out.push_back('_');
     return out;
 }
@@ -773,7 +788,8 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
             }
             if (end_skip) {
                 skip_with_except_cleanup = false;
-                if (opcode == Pyc::RERAISE_A && mod->verCompare(3, 11) >= 0 && operand == 1)
+                if (opcode == Pyc::RERAISE_A && mod->verCompare(3, 11) >= 0
+                        && (operand == 1 || (mod->verCompare(3, 14) >= 0 && operand == 2)))
                     skip_with_except_cleanup_tail = true;
             }
             continue;
@@ -3029,6 +3045,14 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
         case Pyc::RERAISE:
         case Pyc::RERAISE_A:
             {
+                /* Skip compiler-generated cleanup RERAISE at/past handler boundaries
+                   in Python 3.11+.  These are exception-table re-raises, not user code. */
+                if (mod->verCompare(3, 11) >= 0
+                        && curblock->blktype() == ASTBlock::BLK_EXCEPT
+                        && curblock->end() != 0
+                        && curblock->end() <= curpos)
+                    break;
+
                 curblock->append(new ASTRaise(ASTRaise::param_t()));
 
                 if ((curblock->blktype() == ASTBlock::BLK_IF
@@ -3907,6 +3931,11 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
                 PycRef<ASTNode> value = stack.top();
                 stack.pop();
                 curblock->append(new ASTReturn(value, ASTReturn::YIELD));
+                if (mod->verCompare(2, 5) >= 0) {
+                    if (value)
+                        value->setProcessed();
+                    stack.push(value);
+                }
             }
             break;
         case Pyc::YIELD_VALUE_A:
@@ -3916,6 +3945,9 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
                     PycRef<ASTNode> value = stack.top();
                     stack.pop();
                     curblock->append(new ASTReturn(value, ASTReturn::YIELD));
+                    if (value)
+                        value->setProcessed();
+                    stack.push(value);
                 }
             }
             break;
@@ -3979,7 +4011,12 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
                 if (!source.atEof()) {
                     PycBuffer lookahead = source;
                     int lookpos = pos;
-                    bc_next(lookahead, mod, next_opcode, next_operand, lookpos);
+                    do {
+                        bc_next(lookahead, mod, next_opcode, next_operand, lookpos);
+                    } while (!lookahead.atEof()
+                            && next_opcode != Pyc::CACHE
+                            && Pyc::OpcodeName(next_opcode) != NULL
+                            && strncmp(Pyc::OpcodeName(next_opcode), "LOAD_", 5) == 0);
                 }
 
                 if (mod->verCompare(3, 11) >= 0 && next_opcode == Pyc::POP_EXCEPT)
@@ -4617,7 +4654,11 @@ static bool is_terminal_stmt(const PycRef<ASTNode>& node)
 {
     if (node == NULL)
         return false;
-    if (node.type() == ASTNode::NODE_RETURN || node.type() == ASTNode::NODE_RAISE)
+    if (node.type() == ASTNode::NODE_RETURN) {
+        PycRef<ASTReturn> ret = node.cast<ASTReturn>();
+        return ret->rettype() == ASTReturn::RETURN;
+    }
+    if (node.type() == ASTNode::NODE_RAISE)
         return true;
     if (node.type() == ASTNode::NODE_KEYWORD) {
         ASTKeyword::Word kw = node.cast<ASTKeyword>()->key();
@@ -5382,6 +5423,64 @@ static void strip_block_suffix_before_terminal(const PycRef<ASTBlock>& blk, size
     blk->removeLast();
     strip_block_suffix(blk, count);
     blk->append(terminal);
+}
+
+static void normalize_elif_chains(ASTBlock::list_t& lines)
+{
+    for (ASTBlock::list_t::iterator it = lines.begin(); it != lines.end(); ) {
+        PycRef<ASTBlock> elseblk = (*it).try_cast<ASTBlock>();
+        if (elseblk == NULL || elseblk->blktype() != ASTBlock::BLK_ELSE) {
+            ++it;
+            continue;
+        }
+
+        const ASTBlock::list_t& inner = elseblk->nodes();
+        if (inner.empty()) {
+            ++it;
+            continue;
+        }
+
+        PycRef<ASTCondBlock> first = inner.front().try_cast<ASTCondBlock>();
+        if (first == NULL || first->blktype() != ASTBlock::BLK_IF) {
+            ++it;
+            continue;
+        }
+
+        bool valid = true;
+        bool seen_else = false;
+        ASTBlock::list_t::const_iterator jt = inner.begin();
+        ++jt;
+        for (; jt != inner.end(); ++jt) {
+            PycRef<ASTBlock> nested = (*jt).try_cast<ASTBlock>();
+            if (nested == NULL) {
+                valid = false;
+                break;
+            }
+            if (seen_else) {
+                valid = false;
+                break;
+            }
+            if (nested->blktype() == ASTBlock::BLK_ELIF)
+                continue;
+            if (nested->blktype() == ASTBlock::BLK_ELSE) {
+                seen_else = true;
+                continue;
+            }
+            valid = false;
+            break;
+        }
+        if (!valid) {
+            ++it;
+            continue;
+        }
+
+        first->setBlkType(ASTBlock::BLK_ELIF);
+        ASTBlock::list_t::iterator insert_pos = it;
+        ++insert_pos;
+        for (const auto& node : inner)
+            lines.insert(insert_pos, node);
+        it = lines.erase(it);
+    }
 }
 
 static void normalize_sequential_try_regions(ASTBlock::list_t& lines)
@@ -6441,6 +6540,27 @@ static bool extract_enter_assignment(const PycRef<ASTNode>& node,
     return true;
 }
 
+static bool extract_bare_enter_call(const PycRef<ASTNode>& node,
+                                    PycRef<ASTNode>& out_expr)
+{
+    if (node == NULL || node.type() != ASTNode::NODE_CALL)
+        return false;
+    PycRef<ASTCall> call = node.cast<ASTCall>();
+    if (call->func() == NULL || call->func().type() != ASTNode::NODE_BINARY)
+        return false;
+
+    PycRef<ASTBinary> bin = call->func().cast<ASTBinary>();
+    if (bin->op() != ASTBinary::BIN_ATTR
+            || bin->right() == NULL
+            || bin->right().type() != ASTNode::NODE_NAME
+            || !bin->right().cast<ASTName>()->name()->isEqual("__enter__")) {
+        return false;
+    }
+
+    out_expr = bin->left();
+    return true;
+}
+
 static bool is_exit_call_for_var(const PycRef<ASTNode>& node, const PycRef<PycString>& var_name)
 {
     if (node == NULL || node.type() != ASTNode::NODE_CALL)
@@ -6777,9 +6897,39 @@ static ASTBlock::list_t cleanup_linear_statements(const ASTBlock::list_t& lines,
                 continue;
             }
         }
+        if (extract_bare_enter_call(*it, with_expr)) {
+            ASTBlock::list_t::const_iterator jt = it;
+            ++jt;
+            while (jt != patched.end()
+                    && !is_none_exit_call_any_receiver(*jt))
+                ++jt;
+            if (jt != patched.end()) {
+                PycRef<ASTWithBlock> withblk = new ASTWithBlock(0);
+                withblk->setExpr(with_expr);
+                withblk->init();
+                ASTBlock::list_t::const_iterator body = it;
+                ++body;
+                for (; body != jt; ++body) {
+                    if (is_none_exit_call_any_receiver(*body))
+                        continue;
+                    withblk->append(*body);
+                }
+                with_patched.emplace_back(withblk.cast<ASTNode>());
+                it = jt;
+                ASTBlock::list_t::const_iterator after = jt;
+                ++after;
+                if (after != patched.end()
+                        && (*after) != NULL
+                        && (*after).type() == ASTNode::NODE_RAISE
+                        && (*after).cast<ASTRaise>()->params().empty())
+                    it = after;
+                continue;
+            }
+        }
         with_patched.emplace_back(*it);
     }
 
+    normalize_elif_chains(with_patched);
     normalize_nested_with_except(with_patched);
     normalize_sequential_try_regions(with_patched);
     normalize_exception_table_partitions(with_patched);
@@ -6971,10 +7121,12 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
                 if (!first)
                     pyc_output << ", ";
                 if (param.first.type() == ASTNode::NODE_NAME) {
-                    pyc_output << sanitize_identifier(param.first.cast<ASTName>()->name()->value()) << " = ";
+                    pyc_output << sanitize_identifier(param.first.cast<ASTName>()->name()->value(),
+                            mod->majorVer(), mod->minorVer()) << " = ";
                 } else {
                     PycRef<PycString> str_name = param.first.cast<ASTObject>()->object().cast<PycString>();
-                    pyc_output << sanitize_identifier(str_name->value()) << " = ";
+                    pyc_output << sanitize_identifier(str_name->value(),
+                            mod->majorVer(), mod->minorVer()) << " = ";
                 }
                 print_src(param.second, mod, pyc_output);
                 first = false;
@@ -7160,7 +7312,8 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
         }
         break;
     case ASTNode::NODE_NAME:
-        pyc_output << sanitize_identifier(node.cast<ASTName>()->name()->value());
+        pyc_output << sanitize_identifier(node.cast<ASTName>()->name()->value(),
+                mod->majorVer(), mod->minorVer());
         break;
     case ASTNode::NODE_NODELIST:
         {
@@ -7216,7 +7369,8 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
                 print_src(blk.cast<ASTCondBlock>()->cond(), mod, pyc_output);
                 if (except_alias != NULL) {
                     pyc_output << " as ";
-                    pyc_output << sanitize_identifier(except_alias->value());
+                    pyc_output << sanitize_identifier(except_alias->value(),
+                            mod->majorVer(), mod->minorVer());
                 }
             } else if (blk->blktype() == ASTBlock::BLK_WITH) {
                 pyc_output << " ";
@@ -7397,7 +7551,8 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
             for (int i=0; i<code_src->argCount(); i++) {
                 if (narg)
                     pyc_output << ", ";
-                pyc_output << sanitize_identifier(code_src->getLocal(narg++)->value());
+                pyc_output << sanitize_identifier(code_src->getLocal(narg++)->value(),
+                        mod->majorVer(), mod->minorVer());
                 if ((code_src->argCount() - i) <= (int)defargs.size()) {
                     pyc_output << " = ";
                     print_src(*da++, mod, pyc_output);
@@ -7408,7 +7563,8 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
                 pyc_output << (narg == 0 ? "*" : ", *");
                 for (int i = 0; i < code_src->argCount(); i++) {
                     pyc_output << ", ";
-                    pyc_output << sanitize_identifier(code_src->getLocal(narg++)->value());
+                    pyc_output << sanitize_identifier(code_src->getLocal(narg++)->value(),
+                            mod->majorVer(), mod->minorVer());
                     if ((code_src->kwOnlyArgCount() - i) <= (int)kwdefargs.size()) {
                         pyc_output << " = ";
                         print_src(*da++, mod, pyc_output);
@@ -7462,7 +7618,8 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
                 for (int i = 0; i < code_src->argCount(); ++i) {
                     if (narg)
                         pyc_output << ", ";
-                    pyc_output << sanitize_identifier(code_src->getLocal(narg++)->value());
+                    pyc_output << sanitize_identifier(code_src->getLocal(narg++)->value(),
+                            mod->majorVer(), mod->minorVer());
                     if ((code_src->argCount() - i) <= (int)defargs.size()) {
                         pyc_output << " = ";
                         print_src(*da++, mod, pyc_output);
@@ -7473,7 +7630,8 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
                     pyc_output << (narg == 0 ? "*" : ", *");
                     for (int i = 0; i < code_src->kwOnlyArgCount(); ++i) {
                         pyc_output << ", ";
-                        pyc_output << sanitize_identifier(code_src->getLocal(narg++)->value());
+                        pyc_output << sanitize_identifier(code_src->getLocal(narg++)->value(),
+                                mod->majorVer(), mod->minorVer());
                         if ((code_src->kwOnlyArgCount() - i) <= (int)kwdefargs.size()) {
                             pyc_output << " = ";
                             print_src(*da++, mod, pyc_output);
@@ -7483,12 +7641,14 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
                 if (code_src->flags() & PycCode::CO_VARARGS) {
                     if (narg)
                         pyc_output << ", ";
-                    pyc_output << "*" << sanitize_identifier(code_src->getLocal(narg++)->value());
+                    pyc_output << "*" << sanitize_identifier(code_src->getLocal(narg++)->value(),
+                            mod->majorVer(), mod->minorVer());
                 }
                 if (code_src->flags() & PycCode::CO_VARKEYWORDS) {
                     if (narg)
                         pyc_output << ", ";
-                    pyc_output << "**" << sanitize_identifier(code_src->getLocal(narg++)->value());
+                    pyc_output << "**" << sanitize_identifier(code_src->getLocal(narg++)->value(),
+                            mod->majorVer(), mod->minorVer());
                 }
 
                 if (isLambda) {
@@ -7832,6 +7992,8 @@ void decompyle(PycRef<PycCode> code, PycModule* mod, std::ostream& pyc_output)
     // Always strip extraneous trailing return (the compiler always adds one)
     while (clean->nodes().size() > 0 && clean->nodes().back().type() == ASTNode::NODE_RETURN) {
         PycRef<ASTReturn> ret = clean->nodes().back().cast<ASTReturn>();
+        if (ret->rettype() != ASTReturn::RETURN)
+            break;
 
         if (ret->value() == NULL || ret->value().type() == ASTNode::NODE_LOCALS ||
                 is_none_like_node(ret->value())) {
