@@ -19,5 +19,5 @@ del testme [ 2 : 1024 : 10 ] <EOL>
 print '5a' <EOL>
 del testme [ ( 40 , 41 , 42 ) ] <EOL>
 print 6 <EOL>
-del testme [ ( : 42 , ... , : 24 : , 24 , 100 ) ] <EOL>
+del testme [ ( : 42 , ... , : 24 , 24 , 100 ) ] <EOL>
 print 7 <EOL>

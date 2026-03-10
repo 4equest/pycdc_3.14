@@ -1,0 +1,27 @@
+def sequential_try_with_nested_if ( flag ) : <EOL>
+<INDENT>
+prefix = 'keep' <EOL>
+try : <EOL>
+<INDENT>
+if flag : <EOL>
+<INDENT>
+first = int ( '1' ) <EOL>
+<OUTDENT>
+else : <EOL>
+<INDENT>
+first = int ( '2' ) <EOL>
+<OUTDENT>
+<OUTDENT>
+except Exception : <EOL>
+<INDENT>
+first = - 1 <EOL>
+<OUTDENT>
+try : <EOL>
+<INDENT>
+second = 10 // first <EOL>
+<OUTDENT>
+except Exception : <EOL>
+<INDENT>
+second = 0 <EOL>
+<OUTDENT>
+return ( prefix , first , second ) <EOL>

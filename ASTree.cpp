@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
+#include <set>
 #include <unordered_set>
 #include <unordered_map>
 #include <vector>
@@ -40,12 +41,16 @@ static bool is_pass_handler_at_target(const PycRef<PycCode>& code, int target,
 static bool list_contains_offset_in_range(const ASTBlock::list_t& nodes, int start, int end);
 static bool is_bare_reraise_node(const PycRef<ASTNode>& node);
 static bool is_bare_reraise_except_block(const PycRef<ASTBlock>& blk);
+static bool is_pass_only_except_block(const PycRef<ASTBlock>& blk);
+static std::string node_signature(const PycRef<ASTNode>& node);
+static int first_meaningful_offset_in_block(const PycRef<ASTBlock>& blk);
 static void normalize_nested_with_except(ASTBlock::list_t& lines);
 static void normalize_elif_chains(ASTBlock::list_t& lines);
 static void normalize_sequential_try_regions(ASTBlock::list_t& lines);
 static void normalize_exception_table_partitions(ASTBlock::list_t& lines);
 static void normalize_nested_except_handler_partitions(ASTBlock::list_t& lines);
 static void normalize_except_return_rejoin(ASTBlock::list_t& lines);
+static ASTBlock::list_t filter_redundant_cleanup_except_handlers(const ASTBlock::list_t& lines);
 static bool block_returns_none_only(const PycRef<ASTBlock>& blk);
 static bool block_has_terminal_stmt(const PycRef<ASTBlock>& blk);
 static bool is_terminal_stmt(const PycRef<ASTNode>& node);
@@ -180,6 +185,21 @@ static int first_depth_zero_protected_start(const PycRef<PycCode>& code)
     }
 
     return start == std::numeric_limits<int>::max() ? -1 : start;
+}
+
+static int node_partition_offset(const PycRef<ASTNode>& node)
+{
+    if (node == NULL || is_pass_only_node(node))
+        return -1;
+
+    PycRef<ASTBlock> blk = node.try_cast<ASTBlock>();
+    if (blk != NULL) {
+        int off = first_meaningful_offset_in_block(blk);
+        if (off >= 0)
+            return off;
+    }
+
+    return node->offset();
 }
 
 static bool is_python_keyword(const std::string& name, int maj, int min)
@@ -857,7 +877,21 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
         bc_next(source, mod, opcode, operand, pos);
         g_ast_append_offset_hint = curpos;
         if (skip_with_except_cleanup_tail) {
-            if (opcode == Pyc::POP_TOP || opcode == Pyc::POP_EXCEPT)
+            bool skip_tail_opcode = false;
+            if (opcode == Pyc::POP_TOP || opcode == Pyc::POP_EXCEPT || opcode == Pyc::COPY_A)
+                skip_tail_opcode = true;
+            else if (opcode == Pyc::RETURN_VALUE)
+                skip_tail_opcode = true;
+            else if ((opcode == Pyc::RERAISE && mod->verCompare(3, 10) < 0)
+                    || (opcode == Pyc::RERAISE_A
+                        && (operand == 1 || (mod->verCompare(3, 14) >= 0 && operand == 2)))) {
+                skip_tail_opcode = true;
+            } else if (opcode == Pyc::LOAD_CONST_A) {
+                PycRef<PycObject> obj = code->getConst(operand);
+                if (obj != NULL && obj->type() == PycObject::TYPE_NONE)
+                    skip_tail_opcode = true;
+            }
+            if (skip_tail_opcode)
                 continue;
             skip_with_except_cleanup_tail = false;
         }
@@ -4309,30 +4343,45 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
             ASTBlock::list_t prefix_nodes;
             ASTBlock::list_t try_nodes;
             int protected_start = first_depth_zero_protected_start(code);
-            for (ASTBlock::list_t::iterator it = outNodes.begin(); it != firstExcept; ) {
-                ASTBlock::list_t::iterator cur = it++;
-                int off = node_first_offset(*cur);
-                if (protected_start >= 0 && off >= 0 && off < protected_start)
-                    prefix_nodes.emplace_back(*cur);
-                else
-                    try_nodes.emplace_back(*cur);
-                outNodes.erase(cur);
+            bool foundFinallyBoundary = false;
+            for (ASTBlock::list_t::iterator scan = outNodes.begin(); scan != firstExcept; ++scan) {
+                PycRef<ASTBlock> blk = (*scan).try_cast<ASTBlock>();
+                if (blk != NULL && blk->blktype() == ASTBlock::BLK_FINALLY) {
+                    foundFinallyBoundary = true;
+                    break;
+                }
             }
 
-            if (try_nodes.empty()) {
-                try_nodes.swap(prefix_nodes);
-                prefix_nodes.clear();
+            if (!foundFinallyBoundary) {
+                for (ASTBlock::list_t::iterator it = outNodes.begin(); it != firstExcept; ) {
+                    ASTBlock::list_t::iterator cur = it++;
+                    int off = node_partition_offset(*cur);
+                    if (protected_start >= 0 && off >= 0 && off < protected_start) {
+                        prefix_nodes.emplace_back(*cur);
+                        outNodes.erase(cur);
+                        continue;
+                    }
+
+                    if (protected_start < 0 || off < 0 || off >= protected_start) {
+                        try_nodes.emplace_back(*cur);
+                        outNodes.erase(cur);
+                    }
+                }
+
+                if (try_nodes.empty()) {
+                    try_nodes.swap(prefix_nodes);
+                    prefix_nodes.clear();
+                }
+
+                PycRef<ASTBlock> syntheticTry = new ASTBlock(ASTBlock::BLK_TRY, 0, true);
+                syntheticTry->init();
+                for (const auto& node : try_nodes)
+                    syntheticTry->append(node);
+
+                for (const auto& node : prefix_nodes)
+                    outNodes.insert(firstExcept, node);
+                outNodes.insert(firstExcept, syntheticTry.cast<ASTNode>());
             }
-
-            PycRef<ASTBlock> syntheticTry = new ASTBlock(ASTBlock::BLK_TRY, 0, true);
-            syntheticTry->init();
-            for (const auto& node : try_nodes)
-                syntheticTry->append(node);
-
-            ASTBlock::list_t::iterator insert_it = outNodes.begin();
-            for (const auto& node : prefix_nodes)
-                outNodes.insert(insert_it, node);
-            outNodes.insert(insert_it, syntheticTry.cast<ASTNode>());
         }
     }
 
@@ -4688,17 +4737,19 @@ static ASTBlock::list_t normalize_except_sequences(ASTBlock::list_t lines, PycMo
             ASTBlock::list_t::iterator split = normalized.end();
             ASTBlock::list_t::iterator scan = normalized.end();
             bool has_non_cleanup_stmt = false;
-            while (scan != normalized.begin()) {
-                ASTBlock::list_t::iterator prev = scan;
-                --prev;
-                int prev_off = node_first_offset(*prev);
-                if (protected_start >= 0 && prev_off >= 0 && prev_off < protected_start)
-                    break;
-                PycRef<ASTBlock> prev_blk = (*prev).try_cast<ASTBlock>();
-                if (prev_blk != NULL) {
-                    if (prev_blk->blktype() == ASTBlock::BLK_EXCEPT
-                            || prev_blk->blktype() == ASTBlock::BLK_FINALLY
-                            || prev_blk->blktype() == ASTBlock::BLK_CONTAINER) {
+             while (scan != normalized.begin()) {
+                 ASTBlock::list_t::iterator prev = scan;
+                 --prev;
+                 int prev_off = node_first_offset(*prev);
+                 if (protected_start >= 0 && prev_off >= 0 && prev_off < protected_start)
+                     break;
+                 if (is_terminal_stmt(*prev))
+                     break;
+                 PycRef<ASTBlock> prev_blk = (*prev).try_cast<ASTBlock>();
+                 if (prev_blk != NULL) {
+                     if (prev_blk->blktype() == ASTBlock::BLK_EXCEPT
+                             || prev_blk->blktype() == ASTBlock::BLK_FINALLY
+                             || prev_blk->blktype() == ASTBlock::BLK_CONTAINER) {
                         break;
                     }
                     if (prev_blk->blktype() == ASTBlock::BLK_TRY) {
@@ -4737,7 +4788,7 @@ static ASTBlock::list_t normalize_except_sequences(ASTBlock::list_t lines, PycMo
             normalized.emplace_back(ex);
         it = jt;
     }
-    return normalized;
+    return filter_redundant_cleanup_except_handlers(normalized);
 }
 
 static bool is_terminal_stmt(const PycRef<ASTNode>& node)
@@ -5274,10 +5325,13 @@ static bool is_bare_reraise_except_block(const PycRef<ASTBlock>& blk)
         return false;
     bool saw_bare_raise = false;
     for (const auto& child : blk->nodes()) {
-        if (saw_bare_raise)
-            break;
         if (child == NULL || is_pass_only_node(child))
             continue;
+        if (saw_bare_raise) {
+            if (is_control_flow_terminal_stmt(child))
+                return false;
+            continue;
+        }
         PycRef<ASTRaise> raise = child.try_cast<ASTRaise>();
         if (raise != NULL && raise->params().empty()) {
             saw_bare_raise = true;
@@ -5286,6 +5340,99 @@ static bool is_bare_reraise_except_block(const PycRef<ASTBlock>& blk)
         return false;
     }
     return saw_bare_raise;
+}
+
+static bool is_pass_only_except_block(const PycRef<ASTBlock>& blk)
+{
+    if (blk == NULL || blk->blktype() != ASTBlock::BLK_EXCEPT || blk->nodes().empty())
+        return false;
+    for (const auto& child : blk->nodes()) {
+        if (child == NULL || is_pass_only_node(child))
+            continue;
+        return false;
+    }
+    return true;
+}
+
+static bool except_blocks_have_matching_condition(const PycRef<ASTBlock>& lhs,
+        const PycRef<ASTBlock>& rhs)
+{
+    if (lhs == NULL || rhs == NULL || lhs->blktype() != ASTBlock::BLK_EXCEPT
+            || rhs->blktype() != ASTBlock::BLK_EXCEPT) {
+        return false;
+    }
+
+    PycRef<ASTCondBlock> lhs_cond = lhs.try_cast<ASTCondBlock>();
+    PycRef<ASTCondBlock> rhs_cond = rhs.try_cast<ASTCondBlock>();
+    if (lhs_cond == NULL || rhs_cond == NULL)
+        return false;
+    if (lhs_cond->negative() != rhs_cond->negative())
+        return false;
+
+    PycRef<ASTNode> lhs_expr = lhs_cond->cond();
+    PycRef<ASTNode> rhs_expr = rhs_cond->cond();
+    if (lhs_expr == NULL || rhs_expr == NULL)
+        return lhs_expr == NULL && rhs_expr == NULL;
+    return node_signature(lhs_expr) == node_signature(rhs_expr);
+}
+
+static ASTBlock::list_t filter_redundant_cleanup_except_handlers(const ASTBlock::list_t& lines)
+{
+    ASTBlock::list_t filtered;
+    for (ASTBlock::list_t::const_iterator it = lines.begin(); it != lines.end(); ) {
+        PycRef<ASTBlock> exblk = (*it).try_cast<ASTBlock>();
+        if (exblk == NULL || exblk->blktype() != ASTBlock::BLK_EXCEPT) {
+            filtered.emplace_back(*it);
+            ++it;
+            continue;
+        }
+
+        ASTBlock::list_t::const_iterator chain_end = it;
+        while (chain_end != lines.end()) {
+            PycRef<ASTBlock> chain_blk = (*chain_end).try_cast<ASTBlock>();
+            if (chain_blk == NULL || chain_blk->blktype() != ASTBlock::BLK_EXCEPT)
+                break;
+            ++chain_end;
+        }
+
+        for (ASTBlock::list_t::const_iterator cur = it; cur != chain_end; ++cur) {
+            PycRef<ASTBlock> cur_blk = (*cur).try_cast<ASTBlock>();
+            const bool cleanup_only = is_bare_reraise_except_block(cur_blk)
+                    || is_pass_only_except_block(cur_blk);
+            bool drop_current = false;
+            if (cleanup_only) {
+                bool has_later_matching_cleanup = false;
+                for (ASTBlock::list_t::const_iterator later = cur; later != chain_end; ++later) {
+                    if (later == cur)
+                        continue;
+                    PycRef<ASTBlock> later_blk = (*later).try_cast<ASTBlock>();
+                    if (except_blocks_have_matching_condition(cur_blk, later_blk)) {
+                        has_later_matching_cleanup = true;
+                        break;
+                    }
+                }
+                for (ASTBlock::list_t::const_iterator other = it; other != chain_end; ++other) {
+                    if (other == cur)
+                        continue;
+                    PycRef<ASTBlock> other_blk = (*other).try_cast<ASTBlock>();
+                    if (!except_blocks_have_matching_condition(cur_blk, other_blk))
+                        continue;
+
+                    const bool other_cleanup_only = is_bare_reraise_except_block(other_blk)
+                            || is_pass_only_except_block(other_blk);
+                    if (!other_cleanup_only || has_later_matching_cleanup) {
+                        drop_current = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!drop_current)
+                filtered.emplace_back(*cur);
+        }
+        it = chain_end;
+    }
+    return filtered;
 }
 
 static bool extract_cond_terminal_name(const PycRef<ASTNode>& cond, std::string& out_name)
@@ -5351,14 +5498,19 @@ static void normalize_nested_with_except(ASTBlock::list_t& lines)
         ++cleanup_it;
         if (cleanup_it == lines.end())
             continue;
-        PycRef<ASTBlock> cleanup_try = (*cleanup_it).try_cast<ASTBlock>();
-        if (!is_single_none_return_try(cleanup_try))
-            continue;
 
         ASTBlock::list_t::iterator outer_it = cleanup_it;
-        ++outer_it;
-        if (outer_it == lines.end())
-            continue;
+        PycRef<ASTBlock> cleanup_try = (*cleanup_it).try_cast<ASTBlock>();
+        bool has_cleanup_try = false;
+        if (is_single_none_return_try(cleanup_try)) {
+            has_cleanup_try = true;
+            ++outer_it;
+            if (outer_it == lines.end())
+                continue;
+        } else {
+            cleanup_try = NULL;
+        }
+
         PycRef<ASTBlock> outer_ex = (*outer_it).try_cast<ASTBlock>();
         if (outer_ex == NULL || outer_ex->blktype() != ASTBlock::BLK_EXCEPT
                 || !block_returns_none_only(outer_ex)) {
@@ -5444,7 +5596,8 @@ static void normalize_nested_with_except(ASTBlock::list_t& lines)
             outer_ex->append(build_none_tuple_return(tuple_arity));
         }
 
-        lines.erase(cleanup_it);
+        if (has_cleanup_try)
+            lines.erase(cleanup_it);
         lines.erase(inner_it);
     }
 }
@@ -5490,6 +5643,26 @@ static std::vector<MergedExceptionRegion> merged_exception_regions(const PycRef<
     return merged;
 }
 
+static std::vector<MergedExceptionRegion> merged_exception_regions_from_depth(
+        const PycRef<PycCode>& code, int min_depth)
+{
+    std::vector<MergedExceptionRegion> merged;
+    if (code == NULL || code->exceptionTableEntries().empty())
+        return merged;
+
+    int max_depth = min_depth;
+    for (const auto& entry : code->exceptionTableEntries())
+        max_depth = std::max(max_depth, entry.stack_depth);
+
+    for (int depth = min_depth; depth <= max_depth; ++depth) {
+        std::vector<MergedExceptionRegion> depth_regions = merged_exception_regions(code, depth);
+        merged.insert(merged.end(), depth_regions.begin(), depth_regions.end());
+    }
+
+    std::sort(merged.begin(), merged.end(), compare_exception_regions);
+    return merged;
+}
+
 struct ClassifiedExceptionRegions {
     std::vector<MergedExceptionRegion> top_level;
     std::vector<MergedExceptionRegion> nested;
@@ -5501,35 +5674,47 @@ static ClassifiedExceptionRegions classify_depth_zero_try_regions(const PycRef<P
     if (code == NULL)
         return classified;
 
-    int handler_boundary = std::numeric_limits<int>::max();
-    bool has_entries = false;
-    for (const auto& entry : code->exceptionTableEntries()) {
-        handler_boundary = std::min(handler_boundary, entry.target);
-        has_entries = true;
-    }
-    if (!has_entries)
+    if (code->exceptionTableEntries().empty())
         return classified;
 
-    std::unordered_map<int, size_t> by_target;
-    std::vector<MergedExceptionRegion> merged;
+    std::unordered_map<int, std::vector<std::pair<int, int>>> entries_by_target;
+    std::set<int> handler_targets;
     for (const auto& entry : code->exceptionTableEntries()) {
-        if (entry.stack_depth != 0 || entry.start_offset >= handler_boundary)
+        handler_targets.insert(entry.target);
+        if (entry.stack_depth != 0 || entry.end_offset <= entry.start_offset)
             continue;
-        int end = std::min(entry.end_offset, handler_boundary);
-        if (end <= entry.start_offset)
-            continue;
-
-        auto it = by_target.find(entry.target);
-        if (it == by_target.end()) {
-            by_target.emplace(entry.target, merged.size());
-            merged.push_back({ entry.start_offset, end, entry.target, 0 });
-        } else {
-            MergedExceptionRegion& region = merged[it->second];
-            region.start = std::min(region.start, entry.start_offset);
-            region.end = std::max(region.end, end);
-        }
+        entries_by_target[entry.target].push_back(std::make_pair(entry.start_offset, entry.end_offset));
     }
 
+    std::vector<MergedExceptionRegion> merged;
+    for (auto& target_entries : entries_by_target) {
+        const int target = target_entries.first;
+        std::vector<std::pair<int, int>>& entries = target_entries.second;
+        std::sort(entries.begin(), entries.end());
+        if (entries.empty())
+            continue;
+
+        int start = entries.front().first;
+        int end = entries.front().second;
+        for (size_t idx = 1; idx < entries.size(); ++idx) {
+            const int gap_start = end;
+            const int gap_end = entries[idx].first;
+            if (gap_start < gap_end) {
+                std::set<int>::const_iterator handler_it = handler_targets.upper_bound(gap_start);
+                if (handler_it != handler_targets.end() && *handler_it < gap_end) {
+                    if (end > start)
+                        merged.push_back({ start, end, target, 0 });
+                    start = entries[idx].first;
+                    end = entries[idx].second;
+                    continue;
+                }
+            }
+            start = std::min(start, entries[idx].first);
+            end = std::max(end, entries[idx].second);
+        }
+        if (end > start)
+            merged.push_back({ start, end, target, 0 });
+    }
     std::sort(merged.begin(), merged.end(), compare_exception_regions);
     for (size_t i = 0; i < merged.size(); ++i) {
         bool contained = false;
@@ -5550,6 +5735,12 @@ static ClassifiedExceptionRegions classify_depth_zero_try_regions(const PycRef<P
             classified.nested.push_back(merged[i]);
         else
             classified.top_level.push_back(merged[i]);
+    }
+    std::sort(classified.top_level.begin(), classified.top_level.end(), compare_exception_regions);
+    for (size_t i = 0; i + 1 < classified.top_level.size(); ++i) {
+        if (classified.top_level[i].start < classified.top_level[i + 1].start
+                && classified.top_level[i].end > classified.top_level[i + 1].start)
+            classified.top_level[i].end = classified.top_level[i + 1].start;
     }
     return classified;
 }
@@ -5634,6 +5825,26 @@ static void strip_block_suffix_before_terminal(const PycRef<ASTBlock>& blk, size
     blk->removeLast();
     strip_block_suffix(blk, count);
     blk->append(terminal);
+}
+
+static bool strip_matching_finally_suffix(const PycRef<ASTBlock>& blk, const ASTBlock::list_t& suffix)
+{
+    if (blk == NULL || suffix.empty())
+        return false;
+
+    size_t direct_suffix = matching_suffix_len(blk->nodes(), suffix);
+    if (direct_suffix == suffix.size()) {
+        strip_block_suffix(blk, direct_suffix);
+        return true;
+    }
+
+    size_t terminal_suffix = matching_suffix_before_terminal_len(blk->nodes(), suffix);
+    if (terminal_suffix == suffix.size()) {
+        strip_block_suffix_before_terminal(blk, terminal_suffix);
+        return true;
+    }
+
+    return false;
 }
 
 static void normalize_elif_chains(ASTBlock::list_t& lines)
@@ -5784,16 +5995,19 @@ static void normalize_sequential_try_regions(ASTBlock::list_t& lines)
 }
 
 static void partition_nodes_by_exception_regions(const ASTBlock::list_t& nodes,
-        int first_start, int first_end, int second_start,
+        int first_start, int first_end, int second_start, int second_end,
         ASTBlock::list_t& prefix, ASTBlock::list_t& first_region,
-        ASTBlock::list_t& gap_region, ASTBlock::list_t& second_region)
+        ASTBlock::list_t& gap_region, ASTBlock::list_t& second_region,
+        ASTBlock::list_t& suffix_region)
 {
-    enum Bucket { PREFIX, FIRST, GAP, SECOND };
+    enum Bucket { PREFIX, FIRST, GAP, SECOND, SUFFIX };
     Bucket bucket = PREFIX;
     for (const auto& node : nodes) {
-        int off = (node != NULL) ? node->offset() : -1;
+        int off = node_partition_offset(node);
         if (off >= 0) {
-            if (off >= second_start)
+            if (off >= second_end)
+                bucket = SUFFIX;
+            else if (off >= second_start)
                 bucket = SECOND;
             else if (off >= first_end)
                 bucket = GAP;
@@ -5809,8 +6023,10 @@ static void partition_nodes_by_exception_regions(const ASTBlock::list_t& nodes,
             first_region.emplace_back(node);
         else if (bucket == GAP)
             gap_region.emplace_back(node);
-        else
+        else if (bucket == SECOND)
             second_region.emplace_back(node);
+        else
+            suffix_region.emplace_back(node);
     }
 }
 
@@ -5820,8 +6036,10 @@ static void partition_nodes_by_nested_range(const ASTBlock::list_t& nodes,
 {
     enum Bucket { PREFIX, NESTED, SUFFIX };
     Bucket bucket = PREFIX;
+    bool in_try_group = false;
+    Bucket try_group_bucket = PREFIX;
     for (const auto& node : nodes) {
-        int off = (node != NULL) ? node->offset() : -1;
+        int off = node_partition_offset(node);
         if (off >= 0) {
             if (off >= nested_end)
                 bucket = SUFFIX;
@@ -5831,12 +6049,21 @@ static void partition_nodes_by_nested_range(const ASTBlock::list_t& nodes,
                 bucket = PREFIX;
         }
 
+        PycRef<ASTBlock> current_blk = node.try_cast<ASTBlock>();
+        if (current_blk != NULL && current_blk->blktype() == ASTBlock::BLK_TRY) {
+            in_try_group = true;
+            try_group_bucket = bucket;
+        } else if (in_try_group && current_blk != NULL && current_blk->blktype() == ASTBlock::BLK_EXCEPT) {
+            bucket = try_group_bucket;
+        } else {
+            in_try_group = false;
+        }
+
         if (bucket == PREFIX) {
-            PycRef<ASTBlock> blk = node.try_cast<ASTBlock>();
-            if (blk != NULL
-                    && blk->blktype() != ASTBlock::BLK_TRY
-                    && blk->blktype() != ASTBlock::BLK_EXCEPT
-                    && list_contains_offset_in_range(blk->nodes(), nested_start, nested_end))
+            if (current_blk != NULL
+                    && current_blk->blktype() != ASTBlock::BLK_TRY
+                    && current_blk->blktype() != ASTBlock::BLK_EXCEPT
+                    && list_contains_offset_in_range(current_blk->nodes(), nested_start, nested_end))
                 bucket = NESTED;
         }
 
@@ -5864,6 +6091,19 @@ static bool find_nested_region_partition(const PycRef<ASTBlock>& blk,
     if (!nested.empty()
             && !suffix.empty()
             && list_contains_offset_in_range(nested, nested_start, nested_end)) {
+        if (nested.size() == 1) {
+            PycRef<ASTBlock> child = nested.front().try_cast<ASTBlock>();
+            if (child != NULL
+                    && child->blktype() != ASTBlock::BLK_TRY
+                    && child->blktype() != ASTBlock::BLK_EXCEPT
+                    && child->blktype() != ASTBlock::BLK_FINALLY
+                    && child->blktype() != ASTBlock::BLK_CONTAINER
+                    && list_contains_offset_in_range(child->nodes(), nested_start, nested_end)
+                    && find_nested_region_partition(child, nested_start, nested_end,
+                        owner, prefix, nested, suffix)) {
+                return true;
+            }
+        }
         owner = blk;
         return true;
     }
@@ -6021,10 +6261,12 @@ static bool is_pass_handler_at_target(const PycRef<PycCode>& code, int target,
 }
 
 static ASTBlock::list_t::iterator find_matching_typed_except_block(ASTBlock::list_t& lines,
-        ASTBlock::list_t::iterator try_it, int target)
+        ASTBlock::list_t::iterator try_it, int target, int continuation,
+        bool require_exact_target = false)
 {
     ASTBlock::list_t::iterator best = lines.end();
     int best_offset = std::numeric_limits<int>::max();
+    const bool allow_pass_handler = is_pass_handler_at_target(cleanup_current_code, target, continuation);
     ASTBlock::list_t::iterator ex_it = try_it;
     ++ex_it;
     for (; ex_it != lines.end(); ++ex_it) {
@@ -6033,12 +6275,31 @@ static ASTBlock::list_t::iterator find_matching_typed_except_block(ASTBlock::lis
             break;
 
         PycRef<ASTCondBlock> excond = exblk.try_cast<ASTCondBlock>();
-        if (excond == NULL || excond->cond() == NULL)
+        if (excond == NULL)
+            continue;
+        if (excond->cond() == NULL) {
+            bool empty_or_pass_only = exblk->nodes().empty();
+            if (!empty_or_pass_only) {
+                empty_or_pass_only = true;
+                for (const auto& node : exblk->nodes()) {
+                    if (!is_pass_only_node(node)) {
+                        empty_or_pass_only = false;
+                        break;
+                    }
+                }
+            }
+            if (allow_pass_handler && empty_or_pass_only)
+                return ex_it;
+            continue;
+        }
+        if (exblk->end() == target)
+            return ex_it;
+        if (require_exact_target)
             continue;
 
         int first_offset = first_meaningful_offset_in_block(exblk);
         if (first_offset < 0)
-            first_offset = exblk->offset();
+            first_offset = target;
         if (first_offset < target || first_offset >= best_offset)
             continue;
 
@@ -6046,6 +6307,24 @@ static ASTBlock::list_t::iterator find_matching_typed_except_block(ASTBlock::lis
         best_offset = first_offset;
     }
     return best;
+}
+
+static size_t count_typed_except_blocks_after_try(const ASTBlock::list_t& lines,
+        ASTBlock::list_t::const_iterator try_it)
+{
+    size_t count = 0;
+    ASTBlock::list_t::const_iterator ex_it = try_it;
+    ++ex_it;
+    for (; ex_it != lines.end(); ++ex_it) {
+        PycRef<ASTBlock> exblk = (*ex_it).try_cast<ASTBlock>();
+        if (exblk == NULL || exblk->blktype() != ASTBlock::BLK_EXCEPT)
+            break;
+
+        PycRef<ASTCondBlock> excond = exblk.try_cast<ASTCondBlock>();
+        if (excond != NULL && excond->cond() != NULL)
+            ++count;
+    }
+    return count;
 }
 
 static bool is_bare_reraise_node(const PycRef<ASTNode>& node)
@@ -6079,10 +6358,135 @@ static void partition_except_blocks_by_target(ASTBlock::list_t::iterator begin,
     }
 }
 
+static bool starts_self_contained_nested_exception_region(const PycRef<ASTNode>& node,
+        int container_start, int container_end)
+{
+    PycRef<ASTBlock> blk = node.try_cast<ASTBlock>();
+    if (blk == NULL || blk->blktype() != ASTBlock::BLK_TRY)
+        return false;
+
+    int off = node_partition_offset(node);
+    if (off < container_start || off >= container_end)
+        return false;
+
+    ClassifiedExceptionRegions classified = classify_depth_zero_try_regions(cleanup_current_code);
+    for (const auto& region : classified.nested) {
+        if (region.start == off && region.end <= container_end)
+            return true;
+    }
+
+    std::vector<MergedExceptionRegion> nested_regions = merged_exception_regions_from_depth(cleanup_current_code, 1);
+    for (const auto& region : nested_regions) {
+        if (region.start == off && region.end <= container_end)
+            return true;
+    }
+
+    return false;
+}
+
+struct CleanupHandlerExtractionPlan {
+    ASTBlock::list_t::iterator handler_it;
+    ASTBlock::list_t retained;
+};
+
+static void apply_cleanup_handler_extraction_plans(
+        const std::vector<CleanupHandlerExtractionPlan>& plans)
+{
+    for (const auto& plan : plans) {
+        PycRef<ASTBlock> exblk = (*plan.handler_it).try_cast<ASTBlock>();
+        if (exblk == NULL || exblk->blktype() != ASTBlock::BLK_EXCEPT)
+            continue;
+        while (exblk->size() > 0)
+            exblk->removeLast();
+        for (const auto& node : plan.retained)
+            exblk->append(node);
+    }
+}
+
+static bool is_bare_reraise_handler_nodes(const ASTBlock::list_t& nodes)
+{
+    if (nodes.empty())
+        return false;
+    bool saw_bare_raise = false;
+    for (const auto& child : nodes) {
+        if (child == NULL || is_pass_only_node(child))
+            continue;
+        PycRef<ASTRaise> raise = child.try_cast<ASTRaise>();
+        if (raise != NULL && raise->params().empty()) {
+            saw_bare_raise = true;
+            continue;
+        }
+        return false;
+    }
+    return saw_bare_raise;
+}
+
+static void extract_leaked_region_nodes_from_cleanup_handlers(ASTBlock::list_t::iterator begin,
+        ASTBlock::list_t::iterator end,
+        int second_start, int second_end,
+        ASTBlock::list_t& second_region, ASTBlock::list_t& suffix_region,
+        std::vector<ASTBlock::list_t::iterator>& redundant_handlers,
+        std::vector<CleanupHandlerExtractionPlan>& extraction_plans)
+{
+    for (ASTBlock::list_t::iterator it = begin; it != end; ++it) {
+        PycRef<ASTBlock> exblk = (*it).try_cast<ASTBlock>();
+        PycRef<ASTCondBlock> condblk = (*it).try_cast<ASTCondBlock>();
+        if (exblk == NULL || exblk->blktype() != ASTBlock::BLK_EXCEPT || condblk == NULL || condblk->cond() != NULL)
+            continue;
+
+        ASTBlock::list_t retained;
+        ASTBlock::list_t leaked_second;
+        ASTBlock::list_t leaked_suffix;
+        bool retaining_nested_handler_sequence = false;
+        for (const auto& node : exblk->nodes()) {
+            if (is_bare_reraise_node(node) && leaked_second.empty() && leaked_suffix.empty()) {
+                retained.emplace_back(node);
+                continue;
+            }
+            PycRef<ASTBlock> nested_blk = node.try_cast<ASTBlock>();
+            if (starts_self_contained_nested_exception_region(node, second_start, second_end)) {
+                retained.emplace_back(node);
+                retaining_nested_handler_sequence = true;
+                continue;
+            }
+            if (retaining_nested_handler_sequence) {
+                if (nested_blk != NULL && nested_blk->blktype() == ASTBlock::BLK_EXCEPT) {
+                    retained.emplace_back(node);
+                    continue;
+                }
+                retaining_nested_handler_sequence = false;
+            }
+            int off = node_partition_offset(node);
+            if (off >= second_end)
+                leaked_suffix.emplace_back(node);
+            else if (off >= second_start)
+                leaked_second.emplace_back(node);
+            else
+                retained.emplace_back(node);
+        }
+        if (leaked_second.empty() && leaked_suffix.empty())
+            continue;
+
+        CleanupHandlerExtractionPlan plan = { it, retained };
+        extraction_plans.push_back(plan);
+        for (const auto& node : leaked_second)
+            second_region.emplace_back(node);
+        for (const auto& node : leaked_suffix)
+            suffix_region.emplace_back(node);
+        if (retained.empty()) {
+            redundant_handlers.push_back(it);
+            continue;
+        }
+        if (is_bare_reraise_handler_nodes(retained))
+            redundant_handlers.push_back(it);
+    }
+}
+
 static void normalize_exception_table_partitions(ASTBlock::list_t& lines)
 {
     ClassifiedExceptionRegions classified = classify_depth_zero_try_regions(cleanup_current_code);
     const std::vector<MergedExceptionRegion>& top_regions = classified.top_level;
+    std::unordered_set<int> consumed_nested_targets;
     bool changed = true;
     while (changed) {
         changed = false;
@@ -6147,10 +6551,11 @@ static void normalize_exception_table_partitions(ASTBlock::list_t& lines)
                 ASTBlock::list_t first_region;
                 ASTBlock::list_t gap_region;
                 ASTBlock::list_t second_region;
+                ASTBlock::list_t suffix_region;
                 partition_nodes_by_exception_regions(tryblk->nodes(),
-                        first_top.start, first_top.end, second_top.start,
-                        prefix_region, first_region, gap_region, second_region);
-                if (first_region.empty() || second_region.empty())
+                        first_top.start, first_top.end, second_top.start, second_top.end,
+                        prefix_region, first_region, gap_region, second_region, suffix_region);
+                if (first_region.empty())
                     continue;
                 bool prefix_contains_intermediate_region = false;
                 for (const auto& region : top_regions) {
@@ -6168,21 +6573,41 @@ static void normalize_exception_table_partitions(ASTBlock::list_t& lines)
                 if (prefix_contains_intermediate_region)
                     continue;
 
-                if (!has_nested) {
-                    ASTBlock::list_t::iterator after_ex_it = ex1_it;
-                    for (; after_ex_it != lines.end(); ++after_ex_it) {
-                        PycRef<ASTBlock> exblk = (*after_ex_it).try_cast<ASTBlock>();
-                        if (exblk == NULL || exblk->blktype() != ASTBlock::BLK_EXCEPT)
-                            break;
-                    }
+                ASTBlock::list_t::iterator after_ex_it = ex1_it;
+                for (; after_ex_it != lines.end(); ++after_ex_it) {
+                    PycRef<ASTBlock> exblk = (*after_ex_it).try_cast<ASTBlock>();
+                    if (exblk == NULL || exblk->blktype() != ASTBlock::BLK_EXCEPT)
+                        break;
+                }
+                std::vector<ASTBlock::list_t::iterator> redundant_handlers;
+                std::vector<CleanupHandlerExtractionPlan> extraction_plans;
+                extract_leaked_region_nodes_from_cleanup_handlers(ex1_it, after_ex_it,
+                        second_top.start, second_top.end,
+                        second_region, suffix_region, redundant_handlers, extraction_plans);
+                if (second_region.empty())
+                    continue;
 
+                if (!has_nested) {
                     std::vector<ASTBlock::list_t::iterator> first_handlers;
                     std::vector<ASTBlock::list_t::iterator> second_handlers;
                     partition_except_blocks_by_target(ex1_it, after_ex_it,
                             second_top.target, first_handlers, second_handlers);
+                    auto is_redundant_handler = [&](ASTBlock::list_t::iterator candidate) {
+                        for (const auto& redundant : redundant_handlers) {
+                            if (candidate == redundant)
+                                return true;
+                        }
+                        PycRef<ASTBlock> exblk = (*candidate).try_cast<ASTBlock>();
+                        return is_bare_reraise_except_block(exblk);
+                    };
+                    first_handlers.erase(std::remove_if(first_handlers.begin(), first_handlers.end(),
+                                is_redundant_handler), first_handlers.end());
+                    second_handlers.erase(std::remove_if(second_handlers.begin(), second_handlers.end(),
+                                is_redundant_handler), second_handlers.end());
                     if (first_handlers.empty() || second_handlers.empty())
                         continue;
 
+                    apply_cleanup_handler_extraction_plans(extraction_plans);
                     std::vector<PycRef<ASTNode>> second_handler_nodes;
                     for (const auto& handler_it : second_handlers)
                         second_handler_nodes.push_back(*handler_it);
@@ -6194,6 +6619,8 @@ static void normalize_exception_table_partitions(ASTBlock::list_t& lines)
                     for (const auto& node : prefix_region)
                         lines.insert(it, node);
 
+                    for (const auto& handler_it : redundant_handlers)
+                        lines.erase(handler_it);
                     for (const auto& handler_it : second_handlers)
                         lines.erase(handler_it);
 
@@ -6209,6 +6636,8 @@ static void normalize_exception_table_partitions(ASTBlock::list_t& lines)
 
                     for (const auto& node : second_handler_nodes)
                         lines.insert(insert_it, node);
+                    for (const auto& node : suffix_region)
+                        lines.insert(insert_it, node);
                     changed = true;
                     break;
                 }
@@ -6222,6 +6651,7 @@ static void normalize_exception_table_partitions(ASTBlock::list_t& lines)
                 if (nested_body.empty())
                     continue;
 
+                apply_cleanup_handler_extraction_plans(extraction_plans);
                 while (tryblk->size() > 0)
                     tryblk->removeLast();
                 for (const auto& node : first_region)
@@ -6246,14 +6676,36 @@ static void normalize_exception_table_partitions(ASTBlock::list_t& lines)
                 for (const auto& node : gap_region)
                     lines.insert(ex2_it, node);
                 lines.insert(ex3_it, second_try.cast<ASTNode>());
+                ASTBlock::list_t::iterator after_outer = ex3_it;
+                ++after_outer;
+                for (const auto& node : suffix_region)
+                    lines.insert(after_outer, node);
                 lines.erase(ex2_it);
+                consumed_nested_targets.insert(nested_region.target);
                 changed = true;
                 break;
             }
         }
     }
 
-    for (const auto& region : classified.nested) {
+    std::vector<MergedExceptionRegion> nestable_regions = classified.nested;
+    std::vector<MergedExceptionRegion> deeper_regions = merged_exception_regions_from_depth(cleanup_current_code, 1);
+    for (const auto& region : deeper_regions) {
+        bool present = false;
+        for (const auto& existing : nestable_regions) {
+            if (existing.target == region.target) {
+                present = true;
+                break;
+            }
+        }
+        if (!present)
+            nestable_regions.push_back(region);
+    }
+    std::sort(nestable_regions.begin(), nestable_regions.end(), compare_exception_regions);
+
+    for (const auto& region : nestable_regions) {
+        if (consumed_nested_targets.find(region.target) != consumed_nested_targets.end())
+            continue;
         for (ASTBlock::list_t::iterator it = lines.begin(); it != lines.end(); ++it) {
             PycRef<ASTBlock> tryblk = (*it).try_cast<ASTBlock>();
             if (tryblk == NULL || tryblk->blktype() != ASTBlock::BLK_TRY)
@@ -6271,7 +6723,10 @@ static void normalize_exception_table_partitions(ASTBlock::list_t& lines)
                     || !list_contains_offset_in_range(nested_body, region.start, region.end))
                 continue;
 
-            ASTBlock::list_t::iterator nested_ex_it = find_matching_typed_except_block(lines, it, region.target);
+            const bool require_exact_target = region.depth > 0
+                    && count_typed_except_blocks_after_try(lines, it) < 2;
+            ASTBlock::list_t::iterator nested_ex_it = find_matching_typed_except_block(lines, it,
+                    region.target, region.end, require_exact_target);
             if (nested_ex_it == lines.end())
                 continue;
 
@@ -6298,7 +6753,7 @@ static void normalize_exception_table_partitions(ASTBlock::list_t& lines)
 
 static void normalize_nested_except_handler_partitions(ASTBlock::list_t& lines)
 {
-    std::vector<MergedExceptionRegion> nested_regions = merged_exception_regions(cleanup_current_code, 1);
+    std::vector<MergedExceptionRegion> nested_regions = merged_exception_regions_from_depth(cleanup_current_code, 1);
     if (nested_regions.empty())
         return;
 
@@ -6489,35 +6944,35 @@ static void normalize_trailing_reraise_finally(ASTBlock::list_t& lines)
                 for (const auto& ex : first_excepts)
                     finally_body.emplace_back(ex);
             }
-        } else if (first_try != NULL) {
-            // Single try copy. Strip terminal and use it.
-            while (first_try->size() > 0 && is_control_flow_terminal_stmt(first_try->nodes().back()))
-                first_try->removeLast();
-            finally_body.emplace_back(first_try.cast<ASTNode>());
-            for (const auto& ex : first_excepts)
-                finally_body.emplace_back(ex);
+        } else if (!gap_nodes.empty()) {
+            size_t direct_suffix = matching_suffix_len(tryblk->nodes(), gap_nodes);
+            size_t terminal_suffix = matching_suffix_before_terminal_len(tryblk->nodes(), gap_nodes);
+            if (direct_suffix != gap_nodes.size() && terminal_suffix != gap_nodes.size())
+                continue;
+            finally_body = gap_nodes;
+            gap_nodes.clear();
+            for (ASTBlock::list_t::iterator cur = ex_begin; cur != ex_end; ++cur) {
+                PycRef<ASTBlock> exblk = (*cur).try_cast<ASTBlock>();
+                PycRef<ASTCondBlock> condblk = (*cur).try_cast<ASTCondBlock>();
+                if (exblk == NULL || condblk == NULL || condblk->cond() == NULL)
+                    continue;
+                strip_matching_finally_suffix(exblk, finally_body);
+            }
         } else {
-            // No try blocks in tail - use tail_nodes as-is (original behavior)
-            finally_body = tail_nodes;
+            continue;
         }
 
         PycRef<ASTBlock> finallyblk = new ASTBlock(ASTBlock::BLK_FINALLY, 0, true);
         finallyblk->init();
         for (const auto& node : finally_body)
             finallyblk->append(node);
-        if (!finally_body.empty()) {
-            size_t direct_suffix = matching_suffix_len(tryblk->nodes(), finally_body);
-            if (direct_suffix == finally_body.size()) {
-                strip_block_suffix(tryblk, direct_suffix);
-            } else {
-                size_t terminal_suffix = matching_suffix_before_terminal_len(tryblk->nodes(), finally_body);
-                if (terminal_suffix == finally_body.size())
-                    strip_block_suffix_before_terminal(tryblk, terminal_suffix);
-            }
-        }
+        strip_matching_finally_suffix(tryblk, finally_body);
 
         ASTBlock::list_t::iterator insert_pos = lines.erase(ex_end, tail_end);
-        lines.insert(insert_pos, finallyblk.cast<ASTNode>());
+        ASTBlock::list_t::iterator after_finally = lines.insert(insert_pos, finallyblk.cast<ASTNode>());
+        ++after_finally;
+        for (const auto& node : gap_nodes)
+            lines.insert(after_finally, node);
     }
 }
 
@@ -7154,21 +7609,7 @@ static void print_block(PycRef<ASTBlock> blk, PycModule* mod,
 {
     ASTBlock::list_t lines = cleanup_linear_statements(
         normalize_except_sequences(blk->nodes(), mod), &cleanup_enter_context);
-    ASTBlock::list_t filtered_except_lines;
-    for (ASTBlock::list_t::const_iterator it = lines.begin(); it != lines.end(); ++it) {
-        PycRef<ASTBlock> exblk = (*it).try_cast<ASTBlock>();
-        if (exblk != NULL && exblk->blktype() == ASTBlock::BLK_EXCEPT) {
-            ASTBlock::list_t::const_iterator next = it;
-            ++next;
-            const bool has_later_except = (next != lines.end()
-                    && (*next).try_cast<ASTBlock>() != NULL
-                    && (*next).try_cast<ASTBlock>()->blktype() == ASTBlock::BLK_EXCEPT);
-            if (has_later_except && is_bare_reraise_except_block(exblk))
-                continue;
-        }
-        filtered_except_lines.emplace_back(*it);
-    }
-    lines.swap(filtered_except_lines);
+    lines = filter_redundant_cleanup_except_handlers(lines);
     if (blk->blktype() == ASTBlock::BLK_WITH) {
         PycRef<ASTNode> with_var_node = blk.cast<ASTWithBlock>()->var();
         PycRef<ASTName> with_var = with_var_node.try_cast<ASTName>();
